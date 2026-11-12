@@ -81,17 +81,12 @@ h2 { margin-bottom: 0; font: 700 22px var(--display); letter-spacing: -.7px; }
 .request-card, .response-card { border: 1px solid var(--line); border-radius: 15px; background: linear-gradient(145deg, rgba(17, 31, 50, .96), rgba(11, 23, 39, .96)); box-shadow: 0 20px 60px rgba(0,0,0,.12); }
 .request-card { padding: 23px; }
 .field-label { display: block; margin-bottom: 9px; color: #c9d6e8; font-size: 12px; font-weight: 600; }
-textarea, input[type="password"] { width: 100%; color: var(--text); border: 1px solid rgba(160, 185, 218, .17); border-radius: 9px; background: rgba(4, 12, 23, .55); transition: border-color .18s ease, box-shadow .18s ease; }
+textarea { width: 100%; color: var(--text); border: 1px solid rgba(160, 185, 218, .17); border-radius: 9px; background: rgba(4, 12, 23, .55); transition: border-color .18s ease, box-shadow .18s ease; }
 textarea { min-height: 99px; padding: 15px; resize: vertical; font-size: 15px; line-height: 1.6; }
 textarea::placeholder, input::placeholder { color: #66758d; }
 textarea:focus, input:focus { border-color: rgba(102, 228, 230, .65); outline: none; box-shadow: 0 0 0 3px rgba(102, 228, 230, .08); }
 .input-meta { display: flex; justify-content: space-between; gap: 12px; margin: 8px 1px 17px; color: #75849b; font-size: 10px; }
 .input-meta span:last-child { font-family: var(--mono); white-space: nowrap; }
-.agent-options { margin: 0 0 16px; border: 1px solid var(--line); border-radius: 9px; background: rgba(255,255,255,.018); }
-.agent-options summary { padding: 11px 13px; color: #b6c4d7; cursor: pointer; font-size: 11px; font-weight: 600; }
-.agent-options p { margin: 0 13px 13px; color: #8797ae; font-size: 11px; line-height: 1.6; }
-.agent-options .field-label { margin: 0 13px 7px; font-size: 10px; }
-input[type="password"] { width: calc(100% - 26px); margin: 0 13px 13px; padding: 10px 12px; font: 12px var(--mono); }
 .privacy-note { display: flex; gap: 10px; align-items: flex-start; margin: 0 0 18px; padding: 12px; border: 1px solid rgba(255, 189, 101, .14); border-radius: 9px; background: rgba(255, 189, 101, .04); }
 .privacy-note p { margin: 0; color: #b1a991; font-size: 10px; line-height: 1.6; }
 .info-icon { flex: 0 0 15px; width: 15px; height: 15px; display: grid; place-items: center; border: 1px solid rgba(255, 205, 132, .5); border-radius: 50%; color: #ffd18a; font: 500 10px var(--mono); }
@@ -108,8 +103,6 @@ input[type="password"] { width: calc(100% - 26px); margin: 0 13px 13px; padding:
 .empty-state p { margin-bottom: 5px; color: #bdcbe0; font-size: 13px; }
 .empty-state span:last-child { color: #718198; font-size: 10px; }
 .result-copy { margin: 0 0 19px; color: #d9e7f7; font-size: 14px; line-height: 1.7; white-space: pre-wrap; }
-.button-retry { min-height: 38px; margin: -4px 0 16px; padding: 0 12px; color: var(--cyan); border-color: rgba(102, 228, 230, .25); background: rgba(102, 228, 230, .06); font-size: 11px; }
-.button-retry:hover:not(:disabled) { background: rgba(102, 228, 230, .12); }
 .transaction-details { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 14px; margin: 0; padding-top: 15px; border-top: 1px solid var(--line); }
 .transaction-details dt { margin-bottom: 7px; color: #73839c; font: 10px var(--mono); text-transform: uppercase; letter-spacing: .06em; }
 .transaction-details dd { overflow-wrap: anywhere; margin: 0; color: #b8c8dd; font: 10px var(--mono); }
