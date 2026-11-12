@@ -1,8 +1,10 @@
+import { actionCreators, setupWalletSelector } from "https://esm.sh/@near-wallet-selector/core@10.1.4?bundle";
+import { setupMeteorWallet } from "https://esm.sh/@near-wallet-selector/meteor-wallet@10.1.4?bundle";
+
 const CONTRACT_ID = "orbit-hire.shortemail369.testnet";
 const TREASURY_ID = "orbit-treasury.shortemail369.testnet";
 const NETWORK_ID = "testnet";
 const RPC_URL = "https://rpc.testnet.near.org";
-const WALLET_URL = "https://testnet.mynearwallet.com";
 const LOCAL_AGENT_URL = "http://localhost:8787";
 const FEE_YOCTO = "100000000000000000000000";
 const REQUEST_GAS = "100000000000000";
@@ -23,9 +25,7 @@ const requestIdLabel = document.querySelector("#request-id");
 const transactionLink = document.querySelector("#transaction-link");
 const retryButton = document.querySelector("#retry-button");
 
-let near;
-let walletConnection;
-let walletAccount;
+let walletSelector;
 let isSubmitting = false;
 let lastPaidRequest = null;
 
@@ -57,49 +57,49 @@ function resetResult() {
 }
 
 function updateWalletUi() {
-  const signedIn = Boolean(walletConnection?.isSignedIn());
+  const signedIn = Boolean(walletSelector?.isSignedIn());
   if (signedIn) {
-    const accountId = walletConnection.getAccountId();
+    const accountId = walletSelector.store.getState().accounts[0]?.accountId || "Wallet conectada";
     walletButton.textContent = `${accountId.slice(0, 11)}… · Salir`;
     submitButton.disabled = false;
   } else {
-    walletButton.textContent = "Conectar wallet";
+    walletButton.textContent = "Conectar Meteor Wallet";
     submitButton.disabled = true;
   }
 }
 
 async function initializeWallet() {
-  if (!window.nearApi) {
-    throw new Error("No se pudo cargar near-api-js desde el CDN. Revisa tu conexión y recarga.");
-  }
-  near = await window.nearApi.connect({
-    networkId: NETWORK_ID,
-    nodeUrl: RPC_URL,
-    walletUrl: WALLET_URL,
-    helperUrl: "https://helper.testnet.near.org",
-    explorerUrl: "https://explorer.testnet.near.org",
-    keyStore: new window.nearApi.keyStores.BrowserLocalStorageKeyStore(),
+  walletSelector = await setupWalletSelector({
+    network: {
+      networkId: NETWORK_ID,
+      nodeUrl: RPC_URL,
+      helperUrl: "https://helper.testnet.near.org",
+      explorerUrl: "https://explorer.testnet.near.org",
+    },
+    modules: [setupMeteorWallet()],
   });
-  walletConnection = new window.nearApi.WalletConnection(near, "orbithire-static");
-  walletAccount = walletConnection.account();
+  walletSelector.on("signedIn", updateWalletUi);
+  walletSelector.on("signedOut", updateWalletUi);
+  walletSelector.on("accountsChanged", updateWalletUi);
   updateWalletUi();
 }
 
 async function connectWallet() {
-  if (!walletConnection) {
+  if (!walletSelector) {
     showMessage("La conexión con NEAR todavía se está inicializando.");
     return;
   }
-  if (walletConnection.isSignedIn()) {
-    walletConnection.signOut();
-    window.location.reload();
+  const meteorWallet = await walletSelector.wallet("meteor-wallet");
+  if (walletSelector.isSignedIn()) {
+    await meteorWallet.signOut();
+    updateWalletUi();
     return;
   }
-  await walletConnection.requestSignIn({
+  await meteorWallet.signIn({
     contractId: CONTRACT_ID,
     methodNames: ["request_service"],
-    successUrl: window.location.href,
   });
+  updateWalletUi();
 }
 
 function getTransactionHash(outcome) {
@@ -212,8 +212,8 @@ async function pollAgentResult(requestId, token) {
 
 async function submitQuery() {
   if (isSubmitting) return;
-  if (!walletConnection?.isSignedIn()) {
-    showMessage("Conecta primero tu wallet NEAR testnet.");
+  if (!walletSelector?.isSignedIn()) {
+    showMessage("Conecta primero Meteor Wallet en NEAR testnet.");
     return;
   }
   const query = queryInput.value.trim();
@@ -234,12 +234,17 @@ async function submitQuery() {
 
   let transactionHash = "";
   try {
-    const outcome = await walletAccount.functionCall({
-      contractId: CONTRACT_ID,
-      methodName: "request_service",
-      args: { request_id: requestId, query },
-      gas: REQUEST_GAS,
-      attachedDeposit: FEE_YOCTO,
+    const meteorWallet = await walletSelector.wallet("meteor-wallet");
+    const outcome = await meteorWallet.signAndSendTransaction({
+      receiverId: CONTRACT_ID,
+      actions: [
+        actionCreators.functionCall(
+          "request_service",
+          { request_id: requestId, query },
+          BigInt(REQUEST_GAS),
+          BigInt(FEE_YOCTO),
+        ),
+      ],
     });
     transactionHash = getTransactionHash(outcome);
     lastPaidRequest.transactionHash = transactionHash;
@@ -380,7 +385,11 @@ retryButton.addEventListener("click", () => {
 
 showStatus("Conectando con NEAR testnet", "pending");
 initializeWallet()
-  .then(() => showStatus(walletConnection.isSignedIn() ? "Wallet conectada · testnet" : "Conecta tu wallet · testnet"))
+  .then(() =>
+    showStatus(
+      walletSelector.isSignedIn() ? "Meteor Wallet conectada · testnet" : "Conecta Meteor Wallet · testnet",
+    ),
+  )
   .catch((error) => {
     showStatus("NEAR no disponible", "warning");
     showMessage(error.message);
