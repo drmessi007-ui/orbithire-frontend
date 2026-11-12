@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#08111f">
+    <meta
+      name="description"
+      content="OrbitHire conecta consultas espaciales con agentes en NEAR testnet."
+    >
+    <title>OrbitHire — consultas espaciales</title>
+    <link rel="stylesheet" href="./style.css">
+    <script src="https://unpkg.com/near-api-js@2.1.4/dist/near-api-js.min.js" defer></script>
+    <script src="./app.js" defer></script>
+  </head>
+  <body>
+    <div class="page-shell">
+      <header class="topbar">
+        <a class="brand" href="./" aria-label="OrbitHire inicio">
+          <span class="brand-mark" aria-hidden="true">O</span>
+          <span>OrbitHire</span>
+        </a>
+        <div class="network-badges" aria-label="Estado del entorno">
+          <span class="badge badge-beta">BETA</span>
+          <span class="badge badge-network"><span class="pulse-dot"></span> NEAR TESTNET · NO MAINNET</span>
+        </div>
+        <button class="button button-quiet" id="wallet-button" type="button">Conectar wallet</button>
+      </header>
+
+      <main>
+        <section class="hero">
+          <div class="hero-copy">
+            <p class="eyebrow"><span class="eyebrow-line"></span> AGENT ECONOMY · NEAR</p>
+            <h1>Pregúntale al<br><span class="gradient-text">universo.</span></h1>
+            <p class="hero-description">
+              Consultas espaciales, datos abiertos y agentes verificables.
+              Paga una tarifa fija y sigue el recibo en la blockchain.
+            </p>
+            <div class="hero-footnote">
+              <span class="orbit-icon" aria-hidden="true">↗</span>
+              <span>Una experiencia experimental en testnet. Sin valor real.</span>
+            </div>
+          </div>
+          <div class="orbit-art" aria-hidden="true">
+            <div class="orbit orbit-one"></div>
+            <div class="orbit orbit-two"></div>
+            <div class="planet"></div>
+            <div class="orbit-star star-one"></div>
+            <div class="orbit-star star-two"></div>
+            <div class="orbit-star star-three"></div>
+          </div>
+        </section>
+
+        <section class="workspace" aria-labelledby="request-title">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">01 — NUEVA CONSULTA</p>
+              <h2 id="request-title">¿Qué quieres saber?</h2>
+            </div>
+            <div class="fee-pill"><span>Tarifa fija</span><strong>0.1 NEAR</strong></div>
+          </div>
+
+          <div class="request-card">
+            <label class="field-label" for="query">Tu pregunta espacial</label>
+            <textarea
+              id="query"
+              maxlength="500"
+              rows="3"
+              placeholder="¿A qué hora pasa la ISS sobre Osorno?"
+              autocomplete="off"
+            ></textarea>
+            <div class="input-meta">
+              <span>Prueba NOAA o el paso de la ISS sobre Osorno.</span>
+              <span id="char-count">0 / 500</span>
+            </div>
+
+            <details class="agent-options">
+              <summary>Conexión con el agente local</summary>
+              <p>
+                El agente debe estar corriendo en este equipo. El token se envía
+                solo a localhost y no se guarda en el navegador.
+              </p>
+              <label class="field-label" for="agent-token">Token local del agente</label>
+              <input
+                id="agent-token"
+                type="password"
+                placeholder="Pega aquí tu LOCAL_AGENT_TOKEN"
+                autocomplete="off"
+                spellcheck="false"
+              >
+            </details>
+
+            <div class="privacy-note">
+              <span class="info-icon" aria-hidden="true">i</span>
+              <p>
+                Los argumentos de la transacción son públicos en NEAR. No incluyas
+                información sensible. Si el agente no está disponible, el pago
+                ya enviado solo podrá reclamarse según las reglas del contrato.
+              </p>
+            </div>
+
+            <button class="button button-primary" id="submit-button" type="button" disabled>
+              <span>Pagar y consultar</span>
+              <span aria-hidden="true">↗</span>
+            </button>
+            <p class="button-caption">Se solicitará tu aprobación en la wallet · 0.1 NEAR exactos</p>
+          </div>
+        </section>
+
+        <section class="response-section" aria-labelledby="response-title">
+          <div class="section-heading response-heading">
+            <div>
+              <p class="eyebrow">02 — RESULTADO</p>
+              <h2 id="response-title">Tu respuesta</h2>
+            </div>
+            <span class="status-label" id="status-label">A la espera de una consulta</span>
+          </div>
+          <div class="response-card" id="response-card" aria-live="polite">
+            <div class="empty-state" id="empty-state">
+              <span class="empty-orbit" aria-hidden="true">✳</span>
+              <p>La respuesta y el recibo aparecerán aquí.</p>
+              <span>Conecta tu wallet para comenzar.</span>
+            </div>
+            <div class="result-content" id="result-content" hidden>
+              <p class="result-copy" id="result-copy"></p>
+              <button class="button button-retry" id="retry-button" type="button" hidden>
+                Reintentar envío al agente (sin volver a pagar)
+              </button>
+              <dl class="transaction-details">
+                <div>
+                  <dt>Request ID</dt>
+                  <dd id="request-id"></dd>
+                </div>
+                <div>
+                  <dt>Transacción</dt>
+                  <dd><a id="transaction-link" href="#" target="_blank" rel="noopener noreferrer">Ver en NEAR Explorer ↗</a></dd>
+                </div>
+              </dl>
+            </div>
+          </div>
+        </section>
+
+        <section class="contract-strip" aria-label="Contratos desplegados">
+          <div>
+            <span class="contract-dot"></span>
+            <span>OrbitHire</span>
+            <code>orbit-hire.shortemail369.testnet</code>
+          </div>
+          <div>
+            <span class="contract-dot treasury-dot"></span>
+            <span>OrbitTreasury</span>
+            <code>orbit-treasury.shortemail369.testnet</code>
+          </div>
+        </section>
+      </main>
+
+      <footer class="footer">
+        <span>OrbitHire <span aria-hidden="true">·</span> Prototipo de hackathon</span>
+        <a href="https://explorer.testnet.near.org" target="_blank" rel="noopener noreferrer">NEAR Testnet Explorer ↗</a>
+      </footer>
+    </div>
+  </body>
+</html>
