@@ -72,8 +72,8 @@ function updateWalletUi() {
 
 async function initializeWallet() {
   const [core, meteor] = await Promise.all([
-    import("https://esm.sh/@near-wallet-selector/core@10.1.4?bundle&target=es2022"),
-    import("https://esm.sh/@near-wallet-selector/meteor-wallet@10.1.4?bundle&target=es2022"),
+    import("https://cdn.jsdelivr.net/npm/@near-wallet-selector/core@10.1.4/+esm"),
+    import("https://cdn.jsdelivr.net/npm/@near-wallet-selector/meteor-wallet@10.1.4/+esm"),
   ]);
   actionCreators = core.actionCreators;
   setupWalletSelector = core.setupWalletSelector;
@@ -328,7 +328,7 @@ initializeWallet()
     walletButton.disabled = true;
     showStatus("No se pudo inicializar Meteor Wallet", "warning");
     showMessage(
-      `No se pudo inicializar Meteor Wallet en NEAR ${NETWORK_ID}: ${error.message}. Comprueba que el CDN esm.sh sea accesible y que la extensión esté habilitada; luego recarga la página.`,
+      `No se pudo inicializar Meteor Wallet en NEAR ${NETWORK_ID}: ${error.message}. Comprueba que jsDelivr sea accesible y que la extensión esté habilitada; luego recarga la página.`,
     );
   });
 
