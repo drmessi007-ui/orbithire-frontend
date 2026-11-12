@@ -1,6 +1,6 @@
 # OrbitHire static frontend
 
-Static HTML, CSS, and JavaScript for GitHub Pages. No bundler or build step is required. The page loads NEAR Wallet Selector 10.1.4 and its Meteor Wallet module from the pinned esm.sh CDN and connects to **NEAR testnet only**. Install Meteor Wallet from [wallet.meteorwallet.app](https://wallet.meteorwallet.app/).
+Static HTML, CSS, and JavaScript for GitHub Pages. No bundler or build step is required. The page loads NEAR Wallet Selector 10.1.4 and its Meteor Wallet module from the pinned jsDelivr ESM CDN and connects to **NEAR testnet only**. Install Meteor Wallet from [wallet.meteorwallet.app](https://wallet.meteorwallet.app/).
 
 ## Architecture and configuration
 
