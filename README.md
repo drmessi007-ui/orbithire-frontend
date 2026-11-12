@@ -1,12 +1,14 @@
 # OrbitHire static frontend
 
-Static HTML, CSS, and JavaScript for GitHub Pages. No bundler or build step is required. The page uses near-api-js 2.1.4 from the pinned unpkg CDN and connects to **NEAR testnet only**.
+Static HTML, CSS, and JavaScript for GitHub Pages. No bundler or build step is required. The page uses NEAR Wallet Selector 10.1.4 and its Meteor Wallet module from the pinned esm.sh CDN and connects to **NEAR testnet only**. Meteor Wallet is the only supported wallet in this frontend; sign-in is initiated directly from the connection button. Install Meteor Wallet from [wallet.meteorwallet.app](https://wallet.meteorwallet.app/).
+
+The current NEAR documentation marks Wallet Selector as deprecated. This integration uses it to support Meteor Wallet as requested; consider migrating to NEAR Connect if the wallet integration is expanded.
 
 ## GitHub Pages
 
 1. Push the repository to GitHub without the ignored `secrets/` directory or any `.env` file.
 2. In the repository settings, enable GitHub Pages for the branch and `/frontend` folder (or publish the `frontend` folder with your Pages workflow).
-3. Open the published HTTPS page, connect a testnet wallet, enter the query and the local agent token, then select **Pagar y consultar**.
+3. Open the published HTTPS page, connect Meteor Wallet on testnet, enter the query and the local agent token, then select **Pagar y consultar**.
 
 The app pays exactly `0.1 NEAR` to `orbit-hire.shortemail369.testnet` by calling `request_service`. It displays the transaction in NEAR Testnet Explorer. The Treasury contract is listed for transparency; the OrbitHire contract coordinates its escrow calls.
 
@@ -25,4 +27,4 @@ The query is part of the public NEAR transaction arguments. Do not enter secrets
 - Network: NEAR testnet (`https://rpc.testnet.near.org`)
 - Fixed fee: `100000000000000000000000` yoctoNEAR (`0.1 NEAR`)
 
-No signing keys, Jev API keys, or local agent tokens are embedded in the static frontend. The browser wallet signs the payment transaction.
+No signing keys, Jev API keys, or local agent tokens are embedded in the static frontend. Meteor Wallet signs the payment transaction through NEAR Wallet Selector. The app configures Wallet Selector with the NEAR testnet RPC and requests access only to `request_service` on the OrbitHire contract.
