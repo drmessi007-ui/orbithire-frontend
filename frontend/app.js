@@ -1,11 +1,8 @@
-import { actionCreators, setupWalletSelector } from "https://esm.sh/@near-wallet-selector/core@10.1.4?bundle";
-import { setupMeteorWallet } from "https://esm.sh/@near-wallet-selector/meteor-wallet@10.1.4?bundle";
-
 const CONTRACT_ID = "orbit-hire.shortemail369.testnet";
-const TREASURY_ID = "orbit-treasury.shortemail369.testnet";
 const NETWORK_ID = "testnet";
 const RPC_URL = "https://rpc.testnet.near.org";
-const LOCAL_AGENT_URL = "http://localhost:8787";
+// TODO: Replace with the deployed HTTPS agent API origin.
+const AGENT_API_URL = "https://agent-api.example.com";
 const FEE_YOCTO = "100000000000000000000000";
 const REQUEST_GAS = "100000000000000";
 const EXPLORER_URL = "https://explorer.testnet.near.org/transactions/";
@@ -15,32 +12,43 @@ const RESULT_POLL_ATTEMPTS = 48;
 const walletButton = document.querySelector("#wallet-button");
 const submitButton = document.querySelector("#submit-button");
 const queryInput = document.querySelector("#query");
-const tokenInput = document.querySelector("#agent-token");
 const charCount = document.querySelector("#char-count");
+const agentApiNote = document.querySelector("#agent-api-note");
 const statusLabel = document.querySelector("#status-label");
 const emptyState = document.querySelector("#empty-state");
 const resultContent = document.querySelector("#result-content");
 const resultCopy = document.querySelector("#result-copy");
 const requestIdLabel = document.querySelector("#request-id");
 const transactionLink = document.querySelector("#transaction-link");
-const retryButton = document.querySelector("#retry-button");
 
 let walletSelector;
 let meteorWallet;
+let walletReady = false;
+let actionCreators;
+let setupWalletSelector;
+let setupMeteorWallet;
 let isSubmitting = false;
-let lastPaidRequest = null;
+const agentApiConfigured = isValidAgentApiUrl();
+
+function isValidAgentApiUrl() {
+  try {
+    const url = new URL(AGENT_API_URL);
+    return url.protocol === "https:" && !url.hostname.endsWith(".example.com");
+  } catch {
+    return false;
+  }
+}
 
 function showStatus(message, state = "idle") {
   statusLabel.textContent = message;
   statusLabel.dataset.state = state;
 }
 
-function showMessage(message, requestId = "", transactionHash = "", canRetry = false) {
+function showMessage(message, requestId = "", transactionHash = "") {
   emptyState.hidden = true;
   resultContent.hidden = false;
   resultCopy.textContent = message;
   requestIdLabel.textContent = requestId || "—";
-  retryButton.hidden = !canRetry;
   if (transactionHash) {
     transactionLink.href = `${EXPLORER_URL}${encodeURIComponent(transactionHash)}`;
     transactionLink.hidden = false;
@@ -50,37 +58,57 @@ function showMessage(message, requestId = "", transactionHash = "", canRetry = f
   }
 }
 
-function resetResult() {
-  resultContent.hidden = true;
-  emptyState.hidden = false;
-  retryButton.hidden = true;
-  showStatus("A la espera de una consulta");
-}
-
 function updateWalletUi() {
   const signedIn = Boolean(walletSelector?.isSignedIn());
-  walletButton.disabled = !meteorWallet;
+  walletButton.disabled = !walletReady;
+  submitButton.disabled = !signedIn || !agentApiConfigured || isSubmitting;
   if (signedIn) {
     const accountId = walletSelector.store.getState().accounts[0]?.accountId || "Wallet conectada";
     walletButton.textContent = `${accountId.slice(0, 11)}… · Salir`;
-    submitButton.disabled = false;
   } else {
     walletButton.textContent = "Conectar Meteor Wallet";
-    submitButton.disabled = true;
   }
 }
 
 async function initializeWallet() {
+  const [core, meteor] = await Promise.all([
+    import("https://esm.sh/@near-wallet-selector/core@10.1.4?bundle&target=es2022"),
+    import("https://esm.sh/@near-wallet-selector/meteor-wallet@10.1.4?bundle&target=es2022"),
+  ]);
+  actionCreators = core.actionCreators;
+  setupWalletSelector = core.setupWalletSelector;
+  setupMeteorWallet = meteor.setupMeteorWallet;
+  if (
+    typeof setupWalletSelector !== "function" ||
+    typeof setupMeteorWallet !== "function" ||
+    !actionCreators?.functionCall
+  ) {
+    throw new Error("El CDN cargó módulos incompatibles: faltan exports de Wallet Selector 10.1.4.");
+  }
   walletSelector = await setupWalletSelector({
     network: {
       networkId: NETWORK_ID,
       nodeUrl: RPC_URL,
       helperUrl: "https://helper.testnet.near.org",
       explorerUrl: "https://explorer.testnet.near.org",
+      indexerUrl: "https://test.api.fastnear.com/v0",
     },
     modules: [setupMeteorWallet()],
   });
-  meteorWallet = await walletSelector.wallet("meteor-wallet");
+  const meteorModule = walletSelector.store
+    .getState()
+    .modules.find((module) => module.id === "meteor-wallet");
+  if (!meteorModule) {
+    throw new Error("Wallet Selector inició, pero no registró el módulo Meteor Wallet.");
+  }
+  if (!meteorModule.metadata.available) {
+    throw new Error("El módulo Meteor Wallet está registrado, pero no está disponible en este navegador.");
+  }
+  meteorWallet = await meteorModule.wallet();
+  if (!meteorWallet) {
+    throw new Error("Wallet Selector no pudo crear la instancia de Meteor Wallet.");
+  }
+  walletReady = true;
   walletSelector.on("signedIn", updateWalletUi);
   walletSelector.on("signedOut", updateWalletUi);
   walletSelector.on("accountsChanged", updateWalletUi);
@@ -103,8 +131,11 @@ function handleWalletError(error) {
 }
 
 function connectWallet() {
-  if (!walletSelector || !meteorWallet) {
-    showMessage("La conexión con NEAR todavía se está inicializando.");
+  if (!walletReady || !walletSelector || !meteorWallet) {
+    showStatus("Meteor Wallet no está lista", "warning");
+    showMessage(
+      "No se puede abrir Meteor Wallet porque su inicialización no terminó. Revisa el error mostrado y recarga la página después de verificar conexión y extensiones.",
+    );
     return;
   }
   if (walletSelector.isSignedIn()) {
@@ -144,77 +175,29 @@ function pause(ms) {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
-async function sendQueryToAgent(requestId, query, token) {
-  if (!token) {
-    return {
-      ok: false,
-      message: "Pago confirmado, pero falta LOCAL_AGENT_TOKEN. Abre «Conexión con el agente local» para enviarlo.",
-    };
-  }
-  let response;
-  try {
-    response = await fetch(`${LOCAL_AGENT_URL}/requests`, {
-      method: "POST",
-      mode: "cors",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ request_id: requestId, query }),
-      signal: AbortSignal.timeout(7000),
-    });
-  } catch {
-    return {
-      ok: false,
-      message:
-        "El pago quedó registrado en testnet, pero no se pudo contactar al agente en localhost:8787. Inicia el agente local y vuelve a enviar el mismo request ID y query desde esta página; no vuelvas a pagar.",
-    };
-  }
-  if (!response.ok) {
-    if (response.status === 401) {
-      return {
-        ok: false,
-        message:
-          "El pago quedó registrado, pero el token local fue rechazado. Corrige LOCAL_AGENT_TOKEN y reenvía el mismo request ID y query; no vuelvas a pagar.",
-      };
-    }
-    if (response.status === 409) {
-      return { ok: true, message: "El agente ya recibió esta consulta; comprobando su resultado." };
-    }
-    const body = await response.text().catch(() => "");
-    return {
-      ok: false,
-      message: `El pago quedó registrado, pero el agente respondió HTTP ${response.status}${body ? `: ${body}` : ""}.`,
-    };
-  }
-  return { ok: true, message: "El agente recibió la consulta. Esperando el resultado…" };
-}
-
-async function pollAgentResult(requestId, token) {
+async function pollAgentResult(requestId) {
   for (let attempt = 0; attempt < RESULT_POLL_ATTEMPTS; attempt += 1) {
     await pause(RESULT_POLL_INTERVAL_MS);
     let response;
     try {
       response = await fetch(
-        `${LOCAL_AGENT_URL}/requests/${encodeURIComponent(requestId)}`,
-        {
-          headers: { Authorization: `Bearer ${token}` },
-          mode: "cors",
-          signal: AbortSignal.timeout(5000),
-        },
+        `${AGENT_API_URL}/api/requests/${encodeURIComponent(requestId)}`,
+        { mode: "cors", signal: AbortSignal.timeout(5000) },
       );
     } catch {
       return {
         status: "unreachable",
         message:
-          "Se perdió la conexión con el agente local. El pago permanece en testnet; revisa el estado con el request ID y no vuelvas a pagar.",
+          "No se pudo consultar la API HTTPS del agente. El pago permanece en testnet; conserva el request ID y no vuelvas a pagar.",
       };
     }
     if (response.status === 404) continue;
-    if (response.status === 401) {
-      return { status: "failed", message: "El token local expiró o no es válido." };
+    if (!response.ok) {
+      return {
+        status: "failed",
+        message: `La API del agente respondió HTTP ${response.status}. Conserva el request ID y no vuelvas a pagar.`,
+      };
     }
-    if (!response.ok) continue;
     const result = await response.json();
     if (result.status === "completed") {
       return {
@@ -228,19 +211,27 @@ async function pollAgentResult(requestId, token) {
     if (result.status === "failed") {
       return { status: "failed", message: result.message };
     }
-    if (result.status === "processing") {
-      showStatus("Procesando consulta…", "pending");
-    }
+    showStatus(
+      result.status === "queued" ? "Consulta en cola del agente…" : "Procesando consulta…",
+      "pending",
+    );
   }
   return {
     status: "pending",
     message:
-      "El agente todavía no ha publicado un resultado. Conserva el request ID y verifica el agente local; no vuelvas a pagar esta consulta.",
+      "El agente todavía procesa la solicitud. Conserva el request ID y el hash; no vuelvas a pagar esta consulta.",
   };
 }
 
 async function submitQuery() {
   if (isSubmitting) return;
+  if (!agentApiConfigured) {
+    showStatus("API del agente no configurada", "warning");
+    showMessage(
+      "El endpoint HTTPS del agente aún no está configurado. No se puede iniciar un pago hasta desplegar y configurar el agente.",
+    );
+    return;
+  }
   if (!walletSelector?.isSignedIn()) {
     showMessage("Conecta primero Meteor Wallet en NEAR testnet.");
     return;
@@ -253,10 +244,8 @@ async function submitQuery() {
   }
 
   const requestId = window.crypto.randomUUID().toLowerCase();
-  const localToken = tokenInput.value.trim();
-  lastPaidRequest = { requestId, query, transactionHash: "" };
   isSubmitting = true;
-  submitButton.disabled = true;
+  updateWalletUi();
   submitButton.querySelector("span").textContent = "Esperando aprobación…";
   showStatus("Confirma el pago en tu wallet", "pending");
   showMessage("La wallet abrirá una transacción de 0.1 NEAR exactos en NEAR testnet.", requestId);
@@ -275,25 +264,14 @@ async function submitQuery() {
       ],
     });
     transactionHash = getTransactionHash(outcome);
-    lastPaidRequest.transactionHash = transactionHash;
-    showStatus("Pago confirmado · contactando agente", "success");
+    showStatus("Pago confirmado · esperando agente", "success");
     showMessage(
-      "Pago confirmado en NEAR testnet. Intentando entregar la consulta al agente local…",
+      "Pago confirmado en NEAR testnet. El agente observa la cadena y procesará la consulta automáticamente.",
       requestId,
       transactionHash,
     );
 
-    const delivery = await sendQueryToAgent(requestId, query, localToken);
-    if (!delivery.ok) {
-      showStatus("Pago confirmado · agente no disponible", "warning");
-      showMessage(delivery.message, requestId, transactionHash, true);
-      return;
-    }
-
-    tokenInput.value = "";
-    showStatus("Consulta en curso", "pending");
-    showMessage(delivery.message, requestId, transactionHash);
-    const result = await pollAgentResult(requestId, localToken);
+    const result = await pollAgentResult(requestId);
     showStatus(
       result.status === "completed"
         ? "Respuesta recibida"
@@ -304,12 +282,7 @@ async function submitQuery() {
             : "Revisar agente",
       result.status === "completed" ? "success" : result.status === "pending" ? "pending" : "warning",
     );
-    showMessage(
-      result.message,
-      requestId,
-      transactionHash,
-      result.status === "pending" || result.status === "unreachable",
-    );
+    showMessage(result.message, requestId, transactionHash);
   } catch (error) {
     if (transactionHash) {
       showStatus("Transacción enviada · resultado incierto", "warning");
@@ -332,82 +305,14 @@ async function submitQuery() {
   }
 }
 
-async function retryAgentDelivery() {
-  if (!lastPaidRequest || isSubmitting) return;
-  const token = tokenInput.value.trim();
-  if (!token) {
-    showStatus("Falta token del agente", "warning");
-    showMessage(
-      "Pega LOCAL_AGENT_TOKEN en «Conexión con el agente local» para reenviar sin cobrar otra vez.",
-      lastPaidRequest.requestId,
-      lastPaidRequest.transactionHash,
-      true,
-    );
-    tokenInput.focus();
-    return;
-  }
-  isSubmitting = true;
-  retryButton.disabled = true;
-  showStatus("Reenviando al agente · sin pago", "pending");
-  const { requestId, query, transactionHash } = lastPaidRequest;
-  try {
-    const delivery = await sendQueryToAgent(requestId, query, token);
-    if (!delivery.ok) {
-      showStatus("El agente aún no está disponible", "warning");
-      showMessage(delivery.message, requestId, transactionHash, true);
-      return;
-    }
-    tokenInput.value = "";
-    showStatus("Consulta en curso", "pending");
-    showMessage(delivery.message, requestId, transactionHash);
-    const result = await pollAgentResult(requestId, token);
-    showStatus(
-      result.status === "completed"
-        ? "Respuesta recibida"
-        : result.status === "under_review"
-          ? "En revisión humana"
-          : result.status === "pending"
-            ? "Agente procesando"
-            : "Revisar agente",
-      result.status === "completed" ? "success" : result.status === "pending" ? "pending" : "warning",
-    );
-    showMessage(
-      result.message,
-      requestId,
-      transactionHash,
-      result.status === "pending" || result.status === "unreachable",
-    );
-  } catch (error) {
-    showStatus("No se pudo reenviar", "warning");
-    showMessage(`La entrega local falló: ${error.message}`, requestId, transactionHash, true);
-  } finally {
-    isSubmitting = false;
-    retryButton.disabled = false;
-    updateWalletUi();
-  }
-}
-
 queryInput.addEventListener("input", () => {
   charCount.textContent = `${[...queryInput.value].length} / 500`;
 });
-walletButton.addEventListener("click", () => {
-  connectWallet();
-});
+walletButton.addEventListener("click", connectWallet);
 submitButton.addEventListener("click", () => {
   submitQuery().catch((error) => {
     showStatus("Error", "warning");
     showMessage(`No se pudo completar la solicitud: ${error.message}`);
-  });
-});
-retryButton.addEventListener("click", () => {
-  retryAgentDelivery().catch((error) => {
-    showStatus("No se pudo reenviar", "warning");
-    showMessage(
-      `La entrega local falló: ${error.message}`,
-      lastPaidRequest?.requestId,
-      lastPaidRequest?.transactionHash,
-      true,
-    );
   });
 });
 
@@ -419,6 +324,17 @@ initializeWallet()
     ),
   )
   .catch((error) => {
-    showStatus("NEAR no disponible", "warning");
-    showMessage(error.message);
+    walletReady = false;
+    walletButton.disabled = true;
+    showStatus("No se pudo inicializar Meteor Wallet", "warning");
+    showMessage(
+      `No se pudo inicializar Meteor Wallet en NEAR ${NETWORK_ID}: ${error.message}. Comprueba que el CDN esm.sh sea accesible y que la extensión esté habilitada; luego recarga la página.`,
+    );
   });
+
+if (!agentApiConfigured) {
+  showStatus("API del agente pendiente de despliegue", "warning");
+  submitButton.disabled = true;
+} else {
+  agentApiNote.textContent = "La solicitud se procesará en el agente hospedado tras confirmarse en testnet.";
+}

@@ -73,30 +73,17 @@
               <span id="char-count">0 / 500</span>
             </div>
 
-            <details class="agent-options">
-              <summary>Conexión con el agente local</summary>
-              <p>
-                El agente debe estar corriendo en este equipo. El token se envía
-                solo a localhost y no se guarda en el navegador.
-              </p>
-              <label class="field-label" for="agent-token">Token local del agente</label>
-              <input
-                id="agent-token"
-                type="password"
-                placeholder="Pega aquí tu LOCAL_AGENT_TOKEN"
-                autocomplete="off"
-                spellcheck="false"
-              >
-            </details>
-
             <div class="privacy-note">
               <span class="info-icon" aria-hidden="true">i</span>
               <p>
                 Los argumentos de la transacción son públicos en NEAR. No incluyas
-                información sensible. Si el agente no está disponible, el pago
-                ya enviado solo podrá reclamarse según las reglas del contrato.
+                información sensible. Tras el pago, un agente hospedado observa la
+                cadena y procesa la solicitud.
               </p>
             </div>
+            <p class="button-caption" id="agent-api-note">
+              La API HTTPS del agente aún debe configurarse antes de habilitar pagos.
+            </p>
 
             <button class="button button-primary" id="submit-button" type="button" disabled>
               <span>Pagar y consultar</span>
@@ -122,9 +109,6 @@
             </div>
             <div class="result-content" id="result-content" hidden>
               <p class="result-copy" id="result-copy"></p>
-              <button class="button button-retry" id="retry-button" type="button" hidden>
-                Reintentar envío al agente (sin volver a pagar)
-              </button>
               <dl class="transaction-details">
                 <div>
                   <dt>Request ID</dt>
