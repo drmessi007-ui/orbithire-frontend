@@ -26,6 +26,7 @@ const transactionLink = document.querySelector("#transaction-link");
 const retryButton = document.querySelector("#retry-button");
 
 let walletSelector;
+let meteorWallet;
 let isSubmitting = false;
 let lastPaidRequest = null;
 
@@ -58,6 +59,7 @@ function resetResult() {
 
 function updateWalletUi() {
   const signedIn = Boolean(walletSelector?.isSignedIn());
+  walletButton.disabled = !meteorWallet;
   if (signedIn) {
     const accountId = walletSelector.store.getState().accounts[0]?.accountId || "Wallet conectada";
     walletButton.textContent = `${accountId.slice(0, 11)}… · Salir`;
@@ -78,28 +80,55 @@ async function initializeWallet() {
     },
     modules: [setupMeteorWallet()],
   });
+  meteorWallet = await walletSelector.wallet("meteor-wallet");
   walletSelector.on("signedIn", updateWalletUi);
   walletSelector.on("signedOut", updateWalletUi);
   walletSelector.on("accountsChanged", updateWalletUi);
   updateWalletUi();
 }
 
-async function connectWallet() {
-  if (!walletSelector) {
+function startMeteorWalletAction(action) {
+  const originalLog = console.log;
+  console.log = () => {};
+  try {
+    return action();
+  } finally {
+    console.log = originalLog;
+  }
+}
+
+function handleWalletError(error) {
+  showStatus("No se pudo conectar Meteor Wallet", "warning");
+  showMessage(`No se pudo conectar Meteor Wallet: ${error.message}`);
+}
+
+function connectWallet() {
+  if (!walletSelector || !meteorWallet) {
     showMessage("La conexión con NEAR todavía se está inicializando.");
     return;
   }
-  const meteorWallet = await walletSelector.wallet("meteor-wallet");
   if (walletSelector.isSignedIn()) {
-    await meteorWallet.signOut();
-    updateWalletUi();
+    showStatus("Desconectando Meteor Wallet", "pending");
+    meteorWallet.signOut()
+      .then(() => {
+        updateWalletUi();
+        showStatus("Meteor Wallet desconectada · testnet");
+      })
+      .catch(handleWalletError);
     return;
   }
-  await meteorWallet.signIn({
-    contractId: CONTRACT_ID,
-    methodNames: ["request_service"],
-  });
-  updateWalletUi();
+  showStatus("Abriendo Meteor Wallet · testnet", "pending");
+  startMeteorWalletAction(() =>
+    meteorWallet.signIn({
+      contractId: CONTRACT_ID,
+      methodNames: ["request_service"],
+    }),
+  )
+    .then(() => {
+      updateWalletUi();
+      showStatus("Meteor Wallet conectada · testnet", "success");
+    })
+    .catch(handleWalletError);
 }
 
 function getTransactionHash(outcome) {
@@ -234,7 +263,6 @@ async function submitQuery() {
 
   let transactionHash = "";
   try {
-    const meteorWallet = await walletSelector.wallet("meteor-wallet");
     const outcome = await meteorWallet.signAndSendTransaction({
       receiverId: CONTRACT_ID,
       actions: [
@@ -363,7 +391,7 @@ queryInput.addEventListener("input", () => {
   charCount.textContent = `${[...queryInput.value].length} / 500`;
 });
 walletButton.addEventListener("click", () => {
-  connectWallet().catch((error) => showMessage(`No se pudo conectar la wallet: ${error.message}`));
+  connectWallet();
 });
 submitButton.addEventListener("click", () => {
   submitQuery().catch((error) => {

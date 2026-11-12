@@ -2,7 +2,7 @@
 
 Static HTML, CSS, and JavaScript for GitHub Pages. No bundler or build step is required. The page uses NEAR Wallet Selector 10.1.4 and its Meteor Wallet module from the pinned esm.sh CDN and connects to **NEAR testnet only**. Meteor Wallet is the only supported wallet in this frontend; sign-in is initiated directly from the connection button. Install Meteor Wallet from [wallet.meteorwallet.app](https://wallet.meteorwallet.app/).
 
-The current NEAR documentation marks Wallet Selector as deprecated. This integration uses it to support Meteor Wallet as requested; consider migrating to NEAR Connect if the wallet integration is expanded.
+The current NEAR documentation marks Wallet Selector as deprecated. This integration uses it to support Meteor Wallet as requested; consider migrating to NEAR Connect if the wallet integration is expanded. The Meteor module is initialized before enabling the connect button, so its wallet popup opens directly in response to the user's click.
 
 ## GitHub Pages
 
