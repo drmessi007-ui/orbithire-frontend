@@ -124,6 +124,7 @@ textarea:focus, input:focus { border-color: rgba(102, 228, 230, .65); outline: n
 .history-date, .history-id { color: #718198; font: 9px var(--mono); }
 .history-query { margin: 0 0 9px; color: #d9e7f7; font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
 .history-id { margin: 0 0 7px; overflow-wrap: anywhere; }
+.history-result { margin: 0 0 9px; padding: 9px 11px; border-left: 2px solid var(--line); color: #b7c5d9; font-size: 11px; line-height: 1.55; overflow-wrap: anywhere; white-space: pre-wrap; }
 .history-transaction { color: var(--cyan); font-size: 10px; text-decoration: none; }
 .history-transaction:hover { text-decoration: underline; }
 .contract-strip { display: flex; flex-wrap: wrap; gap: 12px 28px; justify-content: center; margin: 29px auto 0; padding: 14px; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }

@@ -20,6 +20,11 @@ const REQUEST_COOLDOWN_STORAGE_PREFIX = "orbithire:request-cooldown:";
 const REQUEST_HISTORY_STORAGE_PREFIX = "orbithire:request-history:";
 const MAX_HISTORY_ENTRIES = 100;
 const HISTORY_STATUSES = new Set(["pending", "completed", "failed", "under_review"]);
+const FINAL_RESULT_STATUSES = new Set(["completed", "failed", "under_review"]);
+const PENDING_RESUME_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const PENDING_UNSIGNED_STALE_MS = 15 * 60 * 1000;
+const HISTORY_RESUME_INTERVAL_MS = 20000;
+const HISTORY_RESULT_MAX_CHARS = 1500;
 
 const walletButton = document.querySelector("#wallet-button");
 const submitButton = document.querySelector("#submit-button");
@@ -59,6 +64,11 @@ let rateLimitWindowLoaded = false;
 let cooldownTimer;
 let cooldownAccountId = null;
 const requestHistoryCache = new Map();
+const activeResultPolls = new Set();
+const renotifiedRequests = new Set();
+let historyResumeTimer;
+let historyResumeRunning = false;
+let uiAccountId = null;
 const historyStorageErrors = new Map();
 const agentApiConfigured = isValidAgentApiUrl();
 
@@ -88,6 +98,28 @@ function showMessage(message, requestId = "", transactionHash = "") {
     transactionLink.removeAttribute("href");
     transactionLink.hidden = true;
   }
+}
+
+function resetResultPanel() {
+  emptyState.hidden = false;
+  resultContent.hidden = true;
+  resultCopy.textContent = "";
+  requestIdLabel.textContent = "";
+  transactionLink.removeAttribute("href");
+  transactionLink.hidden = true;
+}
+
+function getActiveAccountId() {
+  return walletSelector?.isSignedIn()
+    ? walletSelector.store.getState().accounts[0]?.accountId || ""
+    : "";
+}
+
+function truncateResult(text) {
+  const value = typeof text === "string" ? text : "";
+  return value.length > HISTORY_RESULT_MAX_CHARS
+    ? `${value.slice(0, HISTORY_RESULT_MAX_CHARS)}…`
+    : value;
 }
 
 function readLocalCooldownUntil(accountId) {
@@ -419,6 +451,13 @@ function renderHistory(accountId) {
     requestId.textContent = `Request ID: ${entry.requestId}`;
     item.append(header, query, requestId);
 
+    if (typeof entry.resultMessage === "string" && entry.resultMessage) {
+      const resultText = document.createElement("p");
+      resultText.className = "history-result";
+      resultText.textContent = entry.resultMessage;
+      item.append(resultText);
+    }
+
     if (entry.transactionHash) {
       const transaction = document.createElement("a");
       transaction.className = "history-transaction";
@@ -439,17 +478,240 @@ function updateHistoryEntry(accountId, requestId, changes) {
 
   entries[index] = { ...entries[index], ...changes, wallet: accountId, requestId };
   saveRequestHistory(accountId, entries);
-  if (walletSelector?.isSignedIn()) {
-    const activeAccountId = walletSelector.store.getState().accounts[0]?.accountId;
-    if (activeAccountId === accountId) renderHistory(accountId);
-  }
+  if (getActiveAccountId() === accountId) renderHistory(accountId);
 }
 
 function addHistoryEntry(entry) {
   const entries = getRequestHistory(entry.wallet);
   entries.push(entry);
   saveRequestHistory(entry.wallet, entries);
-  renderHistory(entry.wallet);
+  if (getActiveAccountId() === entry.wallet) renderHistory(entry.wallet);
+}
+
+function notifyAgent(requestId, transactionHash, accountId) {
+  if (!transactionHash) return;
+  void fetch(`${AGENT_API_URL}/api/notify`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      request_id: requestId,
+      tx_hash: transactionHash,
+      sender_account_id: accountId,
+    }),
+    signal: AbortSignal.timeout(10000),
+  }).then((response) => {
+    if (!response.ok) {
+      throw new Error(`Notification endpoint responded HTTP ${response.status}`);
+    }
+  }).catch((error) => {
+    console.warn("Agent notification failed; the agent can still scan the chain:", error);
+  });
+}
+
+// Returns the agent's view of a request, {status: "not_found"} on 404, or
+// null when the agent API is unreachable.
+async function fetchAgentRequestStatus(requestId) {
+  try {
+    const response = await fetch(
+      `${AGENT_API_URL}/api/requests/${encodeURIComponent(requestId)}`,
+      { mode: "cors", cache: "no-store", signal: AbortSignal.timeout(5000) },
+    );
+    if (response.status === 404) return { status: "not_found" };
+    if (!response.ok) return null;
+    const result = await response.json();
+    return result && typeof result.status === "string" ? result : null;
+  } catch {
+    return null;
+  }
+}
+
+function agentResultMessage(result) {
+  if (result.status === "completed") {
+    return result.report || result.message || "El agente registró el recibo.";
+  }
+  return result.message || "";
+}
+
+// Returns the contract's status string, null when the request does not exist
+// on chain, or undefined when the RPC could not be reached.
+async function fetchChainRequestStatus(requestId) {
+  try {
+    const result = await rpcQuery({
+      request_type: "call_function",
+      finality: "final",
+      account_id: CONTRACT_ID,
+      method_name: "get_request_status",
+      args_base64: bytesToBase64(new TextEncoder().encode(JSON.stringify({ request_id: requestId }))),
+    });
+    return JSON.parse(new TextDecoder().decode(Uint8Array.from(result.result)));
+  } catch (error) {
+    console.warn("No se pudo consultar el estado on-chain de la solicitud:", error);
+    return undefined;
+  }
+}
+
+function scheduleHistoryResume(delay = HISTORY_RESUME_INTERVAL_MS) {
+  if (historyResumeTimer) window.clearTimeout(historyResumeTimer);
+  historyResumeTimer = window.setTimeout(() => {
+    historyResumeTimer = undefined;
+    void resumePendingHistory(getActiveAccountId());
+  }, delay);
+}
+
+// Keeps "pending" history entries moving after a reload or a wallet switch:
+// asks the agent for the result, re-notifies it once per page load for paid
+// requests it has not seen, and marks unsigned attempts that never reached
+// the chain as failed.
+async function resumePendingHistory(accountId) {
+  if (!accountId || historyResumeRunning) return;
+  historyResumeRunning = true;
+  let stillPending = false;
+  try {
+    const now = Date.now();
+    const pendingEntries = getRequestHistory(accountId).filter((entry) => {
+      const age = now - Date.parse(entry.date);
+      return (
+        entry.status === "pending" &&
+        !activeResultPolls.has(entry.requestId) &&
+        Number.isFinite(age) &&
+        age < PENDING_RESUME_MAX_AGE_MS
+      );
+    });
+    for (const entry of pendingEntries) {
+      if (getActiveAccountId() !== accountId) return;
+      const result = await fetchAgentRequestStatus(entry.requestId);
+      if (result && FINAL_RESULT_STATUSES.has(result.status)) {
+        updateHistoryEntry(accountId, entry.requestId, {
+          status: result.status,
+          resultMessage: truncateResult(agentResultMessage(result)),
+        });
+        continue;
+      }
+      if (entry.transactionHash) {
+        stillPending = true;
+        const agentHasNotSeenIt =
+          result && (result.status === "not_found" || result.status === "waiting_for_event");
+        if (agentHasNotSeenIt && !renotifiedRequests.has(entry.requestId)) {
+          renotifiedRequests.add(entry.requestId);
+          notifyAgent(entry.requestId, entry.transactionHash, accountId);
+        }
+        continue;
+      }
+      if (now - Date.parse(entry.date) < PENDING_UNSIGNED_STALE_MS) {
+        stillPending = true;
+        continue;
+      }
+      const chainStatus = await fetchChainRequestStatus(entry.requestId);
+      if (chainStatus === null) {
+        updateHistoryEntry(accountId, entry.requestId, {
+          status: "failed",
+          resultMessage: "La transacción no llegó a la cadena; esta consulta no se cobró.",
+        });
+      } else {
+        stillPending = true;
+      }
+    }
+  } finally {
+    historyResumeRunning = false;
+  }
+  if (stillPending && getActiveAccountId() === accountId) scheduleHistoryResume();
+}
+
+async function fetchTransaction(transactionHash, accountId) {
+  const response = await fetch(RPC_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: "orbithire",
+      method: "tx",
+      params: {
+        tx_hash: transactionHash,
+        sender_account_id: accountId,
+        wait_until: "EXECUTED_OPTIMISTIC",
+      },
+    }),
+    signal: AbortSignal.timeout(15000),
+  });
+  if (!response.ok) throw new Error(`RPC respondió HTTP ${response.status}`);
+  const body = await response.json();
+  if (body.error || !body.result) throw new Error(body.error?.message || "transacción no encontrada");
+  return body.result;
+}
+
+// Handles wallets that complete signAndSendTransaction with a full-page
+// redirect back to this site (?transactionHashes=… or ?errorCode=…).
+async function handleWalletRedirect() {
+  const url = new URL(window.location.href);
+  const hashes = url.searchParams.get("transactionHashes");
+  const errorCode = url.searchParams.get("errorCode");
+  if (!hashes && !errorCode) return;
+  for (const key of ["transactionHashes", "errorCode", "errorMessage"]) {
+    url.searchParams.delete(key);
+  }
+  window.history.replaceState(window.history.state, "", url.toString());
+
+  const accountId = getActiveAccountId();
+  if (!accountId) return;
+  if (errorCode) {
+    const now = Date.now();
+    const latestUnsigned = getRequestHistory(accountId).find(
+      (entry) =>
+        entry.status === "pending" &&
+        !entry.transactionHash &&
+        now - Date.parse(entry.date) < PENDING_UNSIGNED_STALE_MS * 2,
+    );
+    if (latestUnsigned) {
+      updateHistoryEntry(accountId, latestUnsigned.requestId, { status: "failed" });
+    }
+    showStatus("Pago cancelado o fallido", "warning");
+    showMessage("La wallet no confirmó el pago. Si no aprobaste la transacción, no se envió ninguna consulta.");
+    return;
+  }
+
+  for (const transactionHash of hashes.split(",").map((hash) => hash.trim()).filter(Boolean)) {
+    try {
+      const tx = await fetchTransaction(transactionHash, accountId);
+      const call = tx.transaction?.actions
+        ?.map((action) => action?.FunctionCall)
+        .find((functionCall) => functionCall?.method_name === "request_service");
+      if (!call || tx.transaction.receiver_id !== CONTRACT_ID) continue;
+      const args = JSON.parse(new TextDecoder().decode(base64ToBytes(call.args)));
+      if (typeof args.request_id !== "string") continue;
+      const succeeded = !tx.status?.Failure;
+      const existing = getRequestHistory(accountId).find((entry) => entry.requestId === args.request_id);
+      if (existing) {
+        updateHistoryEntry(accountId, args.request_id, {
+          transactionHash,
+          status: succeeded ? existing.status : "failed",
+        });
+      } else {
+        addHistoryEntry({
+          requestId: args.request_id,
+          wallet: accountId,
+          query: typeof args.query === "string" ? args.query : "",
+          status: succeeded ? "pending" : "failed",
+          transactionHash,
+          date: new Date().toISOString(),
+        });
+      }
+      if (succeeded) {
+        recordRequestCooldown(accountId);
+        notifyAgent(args.request_id, transactionHash, accountId);
+        renotifiedRequests.add(args.request_id);
+        showStatus("Pago confirmado · esperando agente", "success");
+        showMessage(
+          "Pago confirmado en NEAR testnet. El agente procesará la consulta; el historial se actualizará solo.",
+          args.request_id,
+          transactionHash,
+        );
+      }
+    } catch (error) {
+      console.warn("No se pudo procesar la transacción devuelta por la wallet:", error);
+    }
+  }
+  updateWalletUi();
+  scheduleHistoryResume(3000);
 }
 
 function updateWalletUi() {
@@ -457,6 +719,18 @@ function updateWalletUi() {
   const accountId = signedIn
     ? walletSelector.store.getState().accounts[0]?.accountId
     : "";
+  if (accountId !== uiAccountId) {
+    const previousAccountId = uiAccountId;
+    uiAccountId = accountId;
+    // Never leave another wallet's result or history on screen.
+    if (previousAccountId !== null) {
+      resetResultPanel();
+      if (!isSubmitting) {
+        showStatus(accountId ? "Meteor Wallet conectada · testnet" : "Conecta Meteor Wallet · testnet");
+      }
+    }
+    if (accountId) scheduleHistoryResume(500);
+  }
   renderHistory(accountId);
   if (accountId && !chainCooldowns.has(accountId) && !chainCooldownRequests.has(accountId)) {
     chainCooldownRequests.add(accountId);
@@ -678,51 +952,39 @@ function pause(ms) {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
-async function pollAgentResult(requestId) {
+async function pollAgentResult(requestId, accountId) {
+  let consecutiveErrors = 0;
   for (let attempt = 0; attempt < RESULT_POLL_ATTEMPTS; attempt += 1) {
     await pause(RESULT_POLL_INTERVAL_MS);
-    let response;
-    try {
-      response = await fetch(
-        `${AGENT_API_URL}/api/requests/${encodeURIComponent(requestId)}`,
-        { mode: "cors", signal: AbortSignal.timeout(5000) },
+    const result = await fetchAgentRequestStatus(requestId);
+    if (!result) {
+      // Tolerate short network or agent hiccups instead of giving up at once.
+      consecutiveErrors += 1;
+      if (consecutiveErrors >= 3) {
+        return {
+          status: "unreachable",
+          message:
+            "No se pudo consultar la API HTTPS del agente. El pago permanece en testnet; el historial seguirá revisando esta consulta. Conserva el request ID y no vuelvas a pagar.",
+        };
+      }
+      continue;
+    }
+    consecutiveErrors = 0;
+    if (result.status === "not_found") continue;
+    if (FINAL_RESULT_STATUSES.has(result.status)) {
+      return { status: result.status, message: agentResultMessage(result) };
+    }
+    if (getActiveAccountId() === accountId) {
+      showStatus(
+        result.status === "queued" ? "Consulta en cola del agente…" : "Procesando consulta…",
+        "pending",
       );
-    } catch {
-      return {
-        status: "unreachable",
-        message:
-          "No se pudo consultar la API HTTPS del agente. El pago permanece en testnet; conserva el request ID y no vuelvas a pagar.",
-      };
     }
-    if (response.status === 404) continue;
-    if (!response.ok) {
-      return {
-        status: "failed",
-        message: `La API del agente respondió HTTP ${response.status}. Conserva el request ID y no vuelvas a pagar.`,
-      };
-    }
-    const result = await response.json();
-    if (result.status === "completed") {
-      return {
-        status: "completed",
-        message: result.report || result.message || "El agente registró el recibo.",
-      };
-    }
-    if (result.status === "under_review") {
-      return { status: "under_review", message: result.message };
-    }
-    if (result.status === "failed") {
-      return { status: "failed", message: result.message };
-    }
-    showStatus(
-      result.status === "queued" ? "Consulta en cola del agente…" : "Procesando consulta…",
-      "pending",
-    );
   }
   return {
     status: "pending",
     message:
-      "El agente todavía procesa la solicitud. Conserva el request ID y el hash; no vuelvas a pagar esta consulta.",
+      "El agente todavía procesa la solicitud. El historial seguirá revisándola automáticamente; conserva el request ID y el hash y no vuelvas a pagar esta consulta.",
   };
 }
 
@@ -799,6 +1061,16 @@ async function submitQuery() {
   showMessage("La wallet abrirá una transacción de 0.1 NEAR exactos en NEAR testnet.", requestId);
 
   let transactionHash = "";
+  let paymentConfirmed = false;
+  // The user may switch or sign out of the wallet while the agent works; only
+  // paint results for the account that made the request.
+  const statusForAccount = (...args) => {
+    if (getActiveAccountId() === accountId) showStatus(...args);
+  };
+  const messageForAccount = (...args) => {
+    if (getActiveAccountId() === accountId) showMessage(...args);
+  };
+  activeResultPolls.add(requestId);
   try {
     const outcome = await meteorWallet.signAndSendTransaction({
       receiverId: CONTRACT_ID,
@@ -822,32 +1094,18 @@ async function submitQuery() {
     }
     recordRequestCooldown(accountId);
     updateHistoryEntry(accountId, requestId, { transactionHash });
-    if (transactionHash) {
-      void fetch(`${AGENT_API_URL}/api/notify`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          request_id: requestId,
-          tx_hash: transactionHash,
-          sender_account_id: accountId,
-        }),
-      }).then((response) => {
-        if (!response.ok) {
-          throw new Error(`Notification endpoint responded HTTP ${response.status}`);
-        }
-      }).catch((error) => {
-        console.warn("Agent notification failed; the agent can still scan the chain:", error);
-      });
-    }
+    paymentConfirmed = true;
+    notifyAgent(requestId, transactionHash, accountId);
+    renotifiedRequests.add(requestId);
     updateWalletUi();
-    showStatus("Pago confirmado · esperando agente", "success");
-    showMessage(
+    statusForAccount("Pago confirmado · esperando agente", "success");
+    messageForAccount(
       "Pago confirmado en NEAR testnet. El agente observa la cadena y procesará la consulta automáticamente.",
       requestId,
       transactionHash,
     );
 
-    const result = await pollAgentResult(requestId);
+    const result = await pollAgentResult(requestId, accountId);
     const historyStatus =
       result.status === "completed" ||
       result.status === "failed" ||
@@ -857,8 +1115,10 @@ async function submitQuery() {
     updateHistoryEntry(accountId, requestId, {
       status: historyStatus,
       transactionHash,
+      ...(historyStatus === "pending" ? {} : { resultMessage: truncateResult(result.message) }),
     });
-    showStatus(
+    if (historyStatus === "pending") scheduleHistoryResume();
+    statusForAccount(
       result.status === "completed"
         ? "Respuesta recibida"
         : result.status === "under_review"
@@ -868,38 +1128,39 @@ async function submitQuery() {
             : "Revisar agente",
       result.status === "completed" ? "success" : result.status === "pending" ? "pending" : "warning",
     );
-    showMessage(result.message, requestId, transactionHash);
+    messageForAccount(result.message, requestId, transactionHash);
   } catch (error) {
     const errorMessage = error.message || String(error);
     const rateLimited = /rate limit exceeded/i.test(errorMessage);
     if (rateLimited) void refreshChainCooldown(accountId);
     if (error.chainFailure) {
       updateHistoryEntry(accountId, requestId, { status: "failed", transactionHash });
-      showStatus("El contrato rechazó la solicitud", "warning");
-      showMessage(
+      statusForAccount("El contrato rechazó la solicitud", "warning");
+      messageForAccount(
         rateLimited
           ? "El contrato rechazó la llamada: esta cuenta ya tiene una solicitud en la última hora. El depósito se devuelve automáticamente; espera a que venza el límite."
           : `El contrato rechazó la llamada; el depósito se devuelve automáticamente. ${errorMessage}`,
         requestId,
         transactionHash,
       );
-    } else if (transactionHash) {
+    } else if (transactionHash || paymentConfirmed) {
       updateHistoryEntry(accountId, requestId, {
         status: "pending",
         transactionHash,
       });
-      showStatus("Transacción enviada · resultado incierto", "warning");
-      showMessage(
+      scheduleHistoryResume();
+      statusForAccount("Transacción enviada · resultado incierto", "warning");
+      messageForAccount(
         `No se pudo confirmar la respuesta desde el navegador (${error.message}). Comprueba la transacción en el explorador antes de repetir; no vuelvas a pagar a ciegas.`,
         requestId,
         transactionHash,
       );
     } else {
       updateHistoryEntry(accountId, requestId, { status: "failed" });
-      showStatus("Pago cancelado o fallido", "warning");
+      statusForAccount("Pago cancelado o fallido", "warning");
       const contractTrap =
         rateLimited || /WebAssembly trap|unreachable opcode|Smart contract panicked/i.test(errorMessage);
-      showMessage(
+      messageForAccount(
         contractTrap
           ? `El contrato rechazó la llamada. Cada intento usa un request_id nuevo, pero OrbitHire acepta una solicitud por cuenta cada hora. Si esta cuenta ya tuvo una solicitud exitosa en la última hora, espera a que venza ese límite. ${errorMessage}`
           : `La wallet no confirmó el pago. Si no aprobaste la transacción, no se envió ninguna consulta. ${errorMessage}`,
@@ -907,6 +1168,7 @@ async function submitQuery() {
       );
     }
   } finally {
+    activeResultPolls.delete(requestId);
     isSubmitting = false;
     submitButton.querySelector("span").textContent = "Pagar y consultar";
     updateWalletUi();
@@ -928,9 +1190,7 @@ window.addEventListener("storage", (event) => {
     updateWalletUi();
   }
   if (event.key?.startsWith(REQUEST_HISTORY_STORAGE_PREFIX)) {
-    const accountId = walletSelector?.isSignedIn()
-      ? walletSelector.store.getState().accounts[0]?.accountId
-      : "";
+    const accountId = getActiveAccountId();
     if (accountId && event.key === `${REQUEST_HISTORY_STORAGE_PREFIX}${accountId}`) {
       requestHistoryCache.delete(accountId);
       renderHistory(accountId);
@@ -940,7 +1200,8 @@ window.addEventListener("storage", (event) => {
 
 showStatus("Conectando con NEAR testnet", "pending");
 initializeWallet()
-  .then(() => {
+  .then(async () => {
+    await handleWalletRedirect();
     if (agentHealthReady) {
       showStatus(
         walletSelector.isSignedIn()
