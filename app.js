@@ -10,6 +10,9 @@ const RESULT_POLL_ATTEMPTS = 48;
 const AGENT_HEALTH_POLL_INTERVAL_MS = 30000;
 const REQUEST_RATE_LIMIT_MS = 60 * 60 * 1000;
 const REQUEST_COOLDOWN_STORAGE_PREFIX = "orbithire:request-cooldown:";
+const REQUEST_HISTORY_STORAGE_PREFIX = "orbithire:request-history:";
+const MAX_HISTORY_ENTRIES = 100;
+const HISTORY_STATUSES = new Set(["pending", "completed", "failed", "under_review"]);
 
 const walletButton = document.querySelector("#wallet-button");
 const submitButton = document.querySelector("#submit-button");
@@ -22,6 +25,10 @@ const resultContent = document.querySelector("#result-content");
 const resultCopy = document.querySelector("#result-copy");
 const requestIdLabel = document.querySelector("#request-id");
 const transactionLink = document.querySelector("#transaction-link");
+const historyWallet = document.querySelector("#history-wallet");
+const historyStorageNote = document.querySelector("#history-storage-note");
+const historyEmpty = document.querySelector("#history-empty");
+const historyList = document.querySelector("#history-list");
 
 let walletSelector;
 let meteorWallet;
@@ -34,6 +41,8 @@ let agentHealthReady = false;
 let agentHealthCheckInProgress = false;
 let agentHealthCheckPromise;
 const inMemoryRequestCooldowns = new Map();
+const requestHistoryCache = new Map();
+const historyStorageErrors = new Map();
 const agentApiConfigured = isValidAgentApiUrl();
 
 function isValidAgentApiUrl() {
@@ -102,11 +111,158 @@ function formatCooldown(remainingMs) {
     : `${remainingSeconds} s`;
 }
 
+function getRequestHistory(accountId) {
+  if (!accountId) return [];
+  if (requestHistoryCache.has(accountId)) {
+    return requestHistoryCache.get(accountId);
+  }
+
+  try {
+    const stored = window.localStorage.getItem(
+      `${REQUEST_HISTORY_STORAGE_PREFIX}${accountId}`,
+    );
+    const entries = stored ? JSON.parse(stored) : [];
+    if (!Array.isArray(entries)) {
+      throw new Error("El formato del historial local no es válido.");
+    }
+    const history = entries.filter(
+      (entry) =>
+        entry &&
+        entry.wallet === accountId &&
+        typeof entry.requestId === "string" &&
+        typeof entry.query === "string" &&
+        HISTORY_STATUSES.has(entry.status) &&
+        typeof entry.date === "string",
+    );
+    requestHistoryCache.set(accountId, history);
+    historyStorageErrors.delete(accountId);
+    return history;
+  } catch (error) {
+    console.error("No se pudo leer el historial local:", error);
+    requestHistoryCache.set(accountId, []);
+    historyStorageErrors.set(accountId, "No se pudo leer el historial local de esta wallet.");
+    return [];
+  }
+}
+
+function saveRequestHistory(accountId, entries) {
+  const sortedEntries = entries
+    .sort((left, right) => Date.parse(right.date) - Date.parse(left.date))
+    .slice(0, MAX_HISTORY_ENTRIES);
+  requestHistoryCache.set(accountId, sortedEntries);
+  try {
+    window.localStorage.setItem(
+      `${REQUEST_HISTORY_STORAGE_PREFIX}${accountId}`,
+      JSON.stringify(sortedEntries),
+    );
+    historyStorageErrors.delete(accountId);
+    return true;
+  } catch (error) {
+    console.error("No se pudo guardar el historial local:", error);
+    historyStorageErrors.set(accountId, "No se pudo guardar en este navegador; el historial solo se conserva en esta sesión.");
+    return false;
+  }
+}
+
+function renderHistory(accountId) {
+  historyList.replaceChildren();
+  historyStorageNote.hidden = true;
+  historyEmpty.hidden = false;
+  historyList.hidden = true;
+
+  if (!accountId) {
+    historyWallet.textContent = "Conecta una wallet para ver su historial";
+    historyEmpty.textContent = "Las consultas de la wallet conectada aparecerán aquí.";
+    return;
+  }
+
+  historyWallet.textContent = accountId;
+  const entries = getRequestHistory(accountId);
+  const storageError = historyStorageErrors.get(accountId);
+  if (storageError) {
+    historyStorageNote.textContent = storageError;
+    historyStorageNote.hidden = false;
+  }
+  if (entries.length === 0) {
+    historyEmpty.textContent = "Esta wallet todavía no tiene consultas guardadas en este navegador.";
+    return;
+  }
+
+  historyEmpty.hidden = true;
+  historyList.hidden = false;
+  const statusLabels = {
+    pending: "Pendiente",
+    completed: "Completada",
+    failed: "Fallida",
+    under_review: "En revisión",
+  };
+  for (const entry of entries) {
+    const item = document.createElement("li");
+    item.className = "history-entry";
+
+    const header = document.createElement("div");
+    header.className = "history-entry-header";
+    const status = document.createElement("span");
+    status.className = "history-status";
+    status.dataset.state = entry.status;
+    status.textContent = statusLabels[entry.status];
+    const date = document.createElement("time");
+    date.className = "history-date";
+    date.dateTime = entry.date;
+    const parsedDate = new Date(entry.date);
+    date.textContent = Number.isNaN(parsedDate.getTime())
+      ? entry.date
+      : parsedDate.toLocaleString();
+    header.append(status, date);
+
+    const query = document.createElement("p");
+    query.className = "history-query";
+    query.textContent = entry.query;
+
+    const requestId = document.createElement("p");
+    requestId.className = "history-id";
+    requestId.textContent = `Request ID: ${entry.requestId}`;
+    item.append(header, query, requestId);
+
+    if (entry.transactionHash) {
+      const transaction = document.createElement("a");
+      transaction.className = "history-transaction";
+      transaction.href = `${EXPLORER_URL}${encodeURIComponent(entry.transactionHash)}`;
+      transaction.target = "_blank";
+      transaction.rel = "noopener noreferrer";
+      transaction.textContent = "Ver transacción en NEAR Explorer";
+      item.append(transaction);
+    }
+    historyList.append(item);
+  }
+}
+
+function updateHistoryEntry(accountId, requestId, changes) {
+  const entries = getRequestHistory(accountId);
+  const index = entries.findIndex((entry) => entry.requestId === requestId);
+  if (index === -1) return;
+
+  entries[index] = { ...entries[index], ...changes, wallet: accountId, requestId };
+  saveRequestHistory(accountId, entries);
+  if (walletSelector?.isSignedIn()) {
+    const activeAccountId = walletSelector.store.getState().accounts[0]?.accountId;
+    if (activeAccountId === accountId) renderHistory(accountId);
+  }
+}
+
+function addHistoryEntry(entry) {
+  const entries = getRequestHistory(entry.wallet);
+  entries.push(entry);
+  saveRequestHistory(entry.wallet, entries);
+  renderHistory(entry.wallet);
+}
+
 function updateWalletUi() {
   const signedIn = Boolean(walletSelector?.isSignedIn());
   const accountId = signedIn
     ? walletSelector.store.getState().accounts[0]?.accountId
     : "";
+  renderHistory(accountId);
   const cooldownUntil = getRequestCooldownUntil(accountId);
   const cooldownRemaining = Math.max(0, cooldownUntil - Date.now());
   walletButton.disabled = !walletReady;
@@ -376,6 +532,14 @@ async function submitQuery() {
   }
 
   const requestId = window.crypto.randomUUID().toLowerCase();
+  addHistoryEntry({
+    requestId,
+    wallet: accountId,
+    query,
+    status: "pending",
+    transactionHash: "",
+    date: new Date().toISOString(),
+  });
   isSubmitting = true;
   updateWalletUi();
   submitButton.querySelector("span").textContent = "Esperando aprobación…";
@@ -397,6 +561,7 @@ async function submitQuery() {
     });
     recordRequestCooldown(accountId);
     transactionHash = getTransactionHash(outcome);
+    updateHistoryEntry(accountId, requestId, { transactionHash });
     updateWalletUi();
     showStatus("Pago confirmado · esperando agente", "success");
     showMessage(
@@ -406,6 +571,16 @@ async function submitQuery() {
     );
 
     const result = await pollAgentResult(requestId);
+    const historyStatus =
+      result.status === "completed" ||
+      result.status === "failed" ||
+      result.status === "under_review"
+        ? result.status
+        : "pending";
+    updateHistoryEntry(accountId, requestId, {
+      status: historyStatus,
+      transactionHash,
+    });
     showStatus(
       result.status === "completed"
         ? "Respuesta recibida"
@@ -419,6 +594,10 @@ async function submitQuery() {
     showMessage(result.message, requestId, transactionHash);
   } catch (error) {
     if (transactionHash) {
+      updateHistoryEntry(accountId, requestId, {
+        status: "pending",
+        transactionHash,
+      });
       showStatus("Transacción enviada · resultado incierto", "warning");
       showMessage(
         `No se pudo confirmar la respuesta desde el navegador (${error.message}). Comprueba la transacción en el explorador antes de repetir; no vuelvas a pagar a ciegas.`,
@@ -426,6 +605,7 @@ async function submitQuery() {
         transactionHash,
       );
     } else {
+      updateHistoryEntry(accountId, requestId, { status: "failed" });
       showStatus("Pago cancelado o fallido", "warning");
       const errorMessage = error.message || String(error);
       const contractTrap = /WebAssembly trap|unreachable opcode/i.test(errorMessage);
@@ -456,6 +636,15 @@ submitButton.addEventListener("click", () => {
 window.addEventListener("storage", (event) => {
   if (event.key?.startsWith(REQUEST_COOLDOWN_STORAGE_PREFIX)) {
     updateWalletUi();
+  }
+  if (event.key?.startsWith(REQUEST_HISTORY_STORAGE_PREFIX)) {
+    const accountId = walletSelector?.isSignedIn()
+      ? walletSelector.store.getState().accounts[0]?.accountId
+      : "";
+    if (accountId && event.key === `${REQUEST_HISTORY_STORAGE_PREFIX}${accountId}`) {
+      requestHistoryCache.delete(accountId);
+      renderHistory(accountId);
+    }
   }
 });
 

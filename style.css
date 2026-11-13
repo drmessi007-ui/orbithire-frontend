@@ -108,6 +108,24 @@ textarea:focus, input:focus { border-color: rgba(102, 228, 230, .65); outline: n
 .transaction-details dd { overflow-wrap: anywhere; margin: 0; color: #b8c8dd; font: 10px var(--mono); }
 .transaction-details a { color: var(--cyan); text-decoration: none; }
 .transaction-details a:hover { text-decoration: underline; }
+.history-section { max-width: 790px; margin: 34px auto 0; }
+.history-wallet { max-width: 55%; overflow-wrap: anywhere; color: #8293ac; font: 10px var(--mono); text-align: right; }
+.history-card { overflow: hidden; border: 1px solid var(--line); border-radius: 15px; background: linear-gradient(145deg, rgba(17, 31, 50, .96), rgba(11, 23, 39, .96)); }
+.history-storage-note { margin: 0; padding: 11px 16px; border-bottom: 1px solid var(--line); color: #ffd18a; font-size: 11px; }
+.history-empty { margin: 0; padding: 24px; color: #718198; font-size: 12px; text-align: center; }
+.history-list { display: grid; gap: 0; margin: 0; padding: 0; list-style: none; }
+.history-entry { padding: 17px 19px; border-bottom: 1px solid var(--line); }
+.history-entry:last-child { border-bottom: 0; }
+.history-entry-header { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 10px; }
+.history-status { padding: 5px 8px; border: 1px solid var(--line); border-radius: 999px; color: #b7c5d9; font: 9px var(--mono); }
+.history-status[data-state="completed"] { color: var(--green); border-color: rgba(109, 224, 176, .25); }
+.history-status[data-state="failed"] { color: #ff9a9a; border-color: rgba(255, 119, 119, .25); }
+.history-status[data-state="under_review"] { color: #ffd18a; border-color: rgba(255, 190, 102, .3); }
+.history-date, .history-id { color: #718198; font: 9px var(--mono); }
+.history-query { margin: 0 0 9px; color: #d9e7f7; font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
+.history-id { margin: 0 0 7px; overflow-wrap: anywhere; }
+.history-transaction { color: var(--cyan); font-size: 10px; text-decoration: none; }
+.history-transaction:hover { text-decoration: underline; }
 .contract-strip { display: flex; flex-wrap: wrap; gap: 12px 28px; justify-content: center; margin: 29px auto 0; padding: 14px; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
 .contract-strip div { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; color: #8797ae; font-size: 10px; }
 .contract-strip code { color: #687b96; font: 9px var(--mono); }
@@ -131,6 +149,7 @@ textarea:focus, input:focus { border-color: rgba(102, 228, 230, .65); outline: n
   .section-heading { align-items: center; }
   h2 { font-size: 19px; }
   .transaction-details { grid-template-columns: 1fr; }
+  .history-entry { padding: 15px; }
 }
 
 @media (max-width: 420px) {
