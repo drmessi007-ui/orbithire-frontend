@@ -8,6 +8,8 @@ const EXPLORER_URL = "https://explorer.testnet.near.org/transactions/";
 const RESULT_POLL_INTERVAL_MS = 2500;
 const RESULT_POLL_ATTEMPTS = 48;
 const AGENT_HEALTH_POLL_INTERVAL_MS = 30000;
+const REQUEST_RATE_LIMIT_MS = 60 * 60 * 1000;
+const REQUEST_COOLDOWN_STORAGE_PREFIX = "orbithire:request-cooldown:";
 
 const walletButton = document.querySelector("#wallet-button");
 const submitButton = document.querySelector("#submit-button");
@@ -31,6 +33,7 @@ let isSubmitting = false;
 let agentHealthReady = false;
 let agentHealthCheckInProgress = false;
 let agentHealthCheckPromise;
+const inMemoryRequestCooldowns = new Map();
 const agentApiConfigured = isValidAgentApiUrl();
 
 function isValidAgentApiUrl() {
@@ -61,20 +64,68 @@ function showMessage(message, requestId = "", transactionHash = "") {
   }
 }
 
+function getRequestCooldownUntil(accountId) {
+  if (!accountId) return 0;
+
+  const memoryCooldown = inMemoryRequestCooldowns.get(accountId) || 0;
+  try {
+    const storedCooldown = Number(
+      window.localStorage.getItem(`${REQUEST_COOLDOWN_STORAGE_PREFIX}${accountId}`),
+    );
+    if (Number.isFinite(storedCooldown) && storedCooldown > Date.now()) {
+      return Math.max(memoryCooldown, storedCooldown);
+    }
+    window.localStorage.removeItem(`${REQUEST_COOLDOWN_STORAGE_PREFIX}${accountId}`);
+  } catch (error) {
+    console.warn("No se pudo leer el límite local de solicitudes:", error);
+  }
+  return memoryCooldown > Date.now() ? memoryCooldown : 0;
+}
+
+function recordRequestCooldown(accountId) {
+  const cooldownUntil = Date.now() + REQUEST_RATE_LIMIT_MS;
+  inMemoryRequestCooldowns.set(accountId, cooldownUntil);
+  try {
+    window.localStorage.setItem(
+      `${REQUEST_COOLDOWN_STORAGE_PREFIX}${accountId}`,
+      String(cooldownUntil),
+    );
+  } catch (error) {
+    console.warn("No se pudo guardar el límite local de solicitudes:", error);
+  }
+}
+
+function formatCooldown(remainingMs) {
+  const remainingSeconds = Math.ceil(remainingMs / 1000);
+  return remainingSeconds >= 60
+    ? `${Math.ceil(remainingSeconds / 60)} min`
+    : `${remainingSeconds} s`;
+}
+
 function updateWalletUi() {
   const signedIn = Boolean(walletSelector?.isSignedIn());
+  const accountId = signedIn
+    ? walletSelector.store.getState().accounts[0]?.accountId
+    : "";
+  const cooldownUntil = getRequestCooldownUntil(accountId);
+  const cooldownRemaining = Math.max(0, cooldownUntil - Date.now());
   walletButton.disabled = !walletReady;
   submitButton.disabled =
     !signedIn ||
     !agentApiConfigured ||
     !agentHealthReady ||
     agentHealthCheckInProgress ||
+    cooldownRemaining > 0 ||
     isSubmitting;
   if (signedIn) {
-    const accountId = walletSelector.store.getState().accounts[0]?.accountId || "Wallet conectada";
-    walletButton.textContent = `${accountId.slice(0, 11)}… · Salir`;
+    const connectedAccountId = accountId || "Wallet conectada";
+    walletButton.textContent = `${connectedAccountId.slice(0, 11)}… · Salir`;
   } else {
     walletButton.textContent = "Conectar Meteor Wallet";
+  }
+  if (cooldownRemaining > 0) {
+    agentApiNote.textContent =
+      `Esta cuenta ya envió una solicitud. El contrato permite una por hora; podrás pagar de nuevo en aproximadamente ${formatCooldown(cooldownRemaining)}.`;
   }
 }
 
@@ -296,6 +347,21 @@ async function submitQuery() {
     showMessage("Conecta primero Meteor Wallet en NEAR testnet.");
     return;
   }
+  const accountId = walletSelector.store.getState().accounts[0]?.accountId;
+  if (!accountId) {
+    showStatus("No se pudo identificar la cuenta conectada", "warning");
+    showMessage("Desconecta y vuelve a conectar Meteor Wallet antes de enviar una solicitud.");
+    return;
+  }
+  const cooldownRemaining = getRequestCooldownUntil(accountId) - Date.now();
+  if (cooldownRemaining > 0) {
+    showStatus("Límite de solicitudes activo", "warning");
+    showMessage(
+      `El contrato permite una solicitud por cuenta cada hora. Espera aproximadamente ${formatCooldown(cooldownRemaining)} antes de volver a pagar.`,
+    );
+    updateWalletUi();
+    return;
+  }
   const query = queryInput.value.trim();
   if (!query || [...query].length > 500) {
     showMessage("Escribe una consulta de entre 1 y 500 caracteres.");
@@ -329,7 +395,9 @@ async function submitQuery() {
         ),
       ],
     });
+    recordRequestCooldown(accountId);
     transactionHash = getTransactionHash(outcome);
+    updateWalletUi();
     showStatus("Pago confirmado · esperando agente", "success");
     showMessage(
       "Pago confirmado en NEAR testnet. El agente observa la cadena y procesará la consulta automáticamente.",
@@ -359,8 +427,12 @@ async function submitQuery() {
       );
     } else {
       showStatus("Pago cancelado o fallido", "warning");
+      const errorMessage = error.message || String(error);
+      const contractTrap = /WebAssembly trap|unreachable opcode/i.test(errorMessage);
       showMessage(
-        `La wallet no confirmó el pago. Si no aprobaste la transacción, no se envió ninguna consulta. ${error.message}`,
+        contractTrap
+          ? `El contrato rechazó la llamada. Cada intento usa un request_id nuevo, pero OrbitHire acepta una solicitud por cuenta cada hora. Si esta cuenta ya tuvo una solicitud exitosa en la última hora, espera a que venza ese límite. ${errorMessage}`
+          : `La wallet no confirmó el pago. Si no aprobaste la transacción, no se envió ninguna consulta. ${errorMessage}`,
         requestId,
       );
     }
@@ -380,6 +452,11 @@ submitButton.addEventListener("click", () => {
     showStatus("Error", "warning");
     showMessage(`No se pudo completar la solicitud: ${error.message}`);
   });
+});
+window.addEventListener("storage", (event) => {
+  if (event.key?.startsWith(REQUEST_COOLDOWN_STORAGE_PREFIX)) {
+    updateWalletUi();
+  }
 });
 
 showStatus("Conectando con NEAR testnet", "pending");
