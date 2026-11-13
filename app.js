@@ -1,13 +1,13 @@
 const CONTRACT_ID = "orbit-hire.shortemail369.testnet";
 const NETWORK_ID = "testnet";
 const RPC_URL = "https://rpc.testnet.near.org";
-// TODO: Replace with the deployed HTTPS agent API origin.
-const AGENT_API_URL = "https://agent-api.example.com";
+const AGENT_API_URL = "https://agent.deosorno.cl";
 const FEE_YOCTO = "100000000000000000000000";
 const REQUEST_GAS = "100000000000000";
 const EXPLORER_URL = "https://explorer.testnet.near.org/transactions/";
 const RESULT_POLL_INTERVAL_MS = 2500;
 const RESULT_POLL_ATTEMPTS = 48;
+const AGENT_HEALTH_POLL_INTERVAL_MS = 30000;
 
 const walletButton = document.querySelector("#wallet-button");
 const submitButton = document.querySelector("#submit-button");
@@ -28,6 +28,9 @@ let actionCreators;
 let setupWalletSelector;
 let setupMeteorWallet;
 let isSubmitting = false;
+let agentHealthReady = false;
+let agentHealthCheckInProgress = false;
+let agentHealthCheckPromise;
 const agentApiConfigured = isValidAgentApiUrl();
 
 function isValidAgentApiUrl() {
@@ -61,13 +64,70 @@ function showMessage(message, requestId = "", transactionHash = "") {
 function updateWalletUi() {
   const signedIn = Boolean(walletSelector?.isSignedIn());
   walletButton.disabled = !walletReady;
-  submitButton.disabled = !signedIn || !agentApiConfigured || isSubmitting;
+  submitButton.disabled =
+    !signedIn ||
+    !agentApiConfigured ||
+    !agentHealthReady ||
+    agentHealthCheckInProgress ||
+    isSubmitting;
   if (signedIn) {
     const accountId = walletSelector.store.getState().accounts[0]?.accountId || "Wallet conectada";
     walletButton.textContent = `${accountId.slice(0, 11)}… · Salir`;
   } else {
     walletButton.textContent = "Conectar Meteor Wallet";
   }
+}
+
+function checkAgentHealth() {
+  if (!agentApiConfigured) {
+    agentHealthReady = false;
+    agentApiNote.textContent =
+      "La URL HTTPS del agente es un placeholder. Configúrala antes de habilitar pagos.";
+    showStatus("API del agente pendiente de despliegue", "warning");
+    updateWalletUi();
+    return Promise.resolve(false);
+  }
+  if (agentHealthCheckPromise) return agentHealthCheckPromise;
+
+  agentHealthCheckInProgress = true;
+  updateWalletUi();
+  agentHealthCheckPromise = (async () => {
+    try {
+      const response = await fetch(`${AGENT_API_URL}/health`, {
+        mode: "cors",
+        cache: "no-store",
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!response.ok) {
+        throw new Error(`El servicio respondió HTTP ${response.status}`);
+      }
+      const health = await response.json();
+      if (health.ok !== true || health.network !== NETWORK_ID) {
+        throw new Error("El servicio no confirmó que está disponible en NEAR testnet");
+      }
+      agentHealthReady = true;
+      agentApiNote.textContent = "API HTTPS del agente disponible · NEAR testnet.";
+      if (walletReady && !isSubmitting) {
+        showStatus(
+          walletSelector.isSignedIn()
+            ? "Meteor Wallet conectada · testnet"
+            : "Conecta Meteor Wallet · testnet",
+        );
+      }
+      return true;
+    } catch (error) {
+      agentHealthReady = false;
+      agentApiNote.textContent =
+        `API HTTPS del agente no disponible: ${error.message}. El pago permanece deshabilitado.`;
+      showStatus("API del agente no disponible", "warning");
+      return false;
+    } finally {
+      agentHealthCheckInProgress = false;
+      agentHealthCheckPromise = undefined;
+      updateWalletUi();
+    }
+  })();
+  return agentHealthCheckPromise;
 }
 
 async function initializeWallet() {
@@ -224,7 +284,7 @@ async function pollAgentResult(requestId) {
 }
 
 async function submitQuery() {
-  if (isSubmitting) return;
+  if (isSubmitting || agentHealthCheckInProgress) return;
   if (!agentApiConfigured) {
     showStatus("API del agente no configurada", "warning");
     showMessage(
@@ -240,6 +300,12 @@ async function submitQuery() {
   if (!query || [...query].length > 500) {
     showMessage("Escribe una consulta de entre 1 y 500 caracteres.");
     queryInput.focus();
+    return;
+  }
+  if (!(await checkAgentHealth())) {
+    showMessage(
+      "La API HTTPS del agente no respondió correctamente en /health. No se envió ningún pago; inténtalo de nuevo cuando el agente esté disponible.",
+    );
     return;
   }
 
@@ -318,11 +384,15 @@ submitButton.addEventListener("click", () => {
 
 showStatus("Conectando con NEAR testnet", "pending");
 initializeWallet()
-  .then(() =>
-    showStatus(
-      walletSelector.isSignedIn() ? "Meteor Wallet conectada · testnet" : "Conecta Meteor Wallet · testnet",
-    ),
-  )
+  .then(() => {
+    if (agentHealthReady) {
+      showStatus(
+        walletSelector.isSignedIn()
+          ? "Meteor Wallet conectada · testnet"
+          : "Conecta Meteor Wallet · testnet",
+      );
+    }
+  })
   .catch((error) => {
     walletReady = false;
     walletButton.disabled = true;
@@ -332,9 +402,7 @@ initializeWallet()
     );
   });
 
-if (!agentApiConfigured) {
-  showStatus("API del agente pendiente de despliegue", "warning");
-  submitButton.disabled = true;
-} else {
-  agentApiNote.textContent = "La solicitud se procesará en el agente hospedado tras confirmarse en testnet.";
-}
+void checkAgentHealth();
+window.setInterval(() => {
+  void checkAgentHealth();
+}, AGENT_HEALTH_POLL_INTERVAL_MS);
