@@ -562,6 +562,23 @@ async function submitQuery() {
     recordRequestCooldown(accountId);
     transactionHash = getTransactionHash(outcome);
     updateHistoryEntry(accountId, requestId, { transactionHash });
+    if (transactionHash) {
+      void fetch(`${AGENT_API_URL}/api/notify`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          request_id: requestId,
+          tx_hash: transactionHash,
+          sender_account_id: accountId,
+        }),
+      }).then((response) => {
+        if (!response.ok) {
+          throw new Error(`Notification endpoint responded HTTP ${response.status}`);
+        }
+      }).catch((error) => {
+        console.warn("Agent notification failed; the agent can still scan the chain:", error);
+      });
+    }
     updateWalletUi();
     showStatus("Pago confirmado · esperando agente", "success");
     showMessage(
