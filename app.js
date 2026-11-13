@@ -8,6 +8,8 @@ const EXPLORER_URL = "https://explorer.testnet.near.org/transactions/";
 const RESULT_POLL_INTERVAL_MS = 2500;
 const RESULT_POLL_ATTEMPTS = 48;
 const AGENT_HEALTH_POLL_INTERVAL_MS = 30000;
+const AGENT_HEALTH_RETRY_MS = 5000;
+const AGENT_HEALTH_FAILURES_BEFORE_BLOCK = 2;
 const REQUEST_RATE_LIMIT_MS = 60 * 60 * 1000;
 const REQUEST_COOLDOWN_STORAGE_PREFIX = "orbithire:request-cooldown:";
 const REQUEST_HISTORY_STORAGE_PREFIX = "orbithire:request-history:";
@@ -37,9 +39,13 @@ let actionCreators;
 let setupWalletSelector;
 let setupMeteorWallet;
 let isSubmitting = false;
+let isPreparingPayment = false;
 let agentHealthReady = false;
 let agentHealthCheckInProgress = false;
 let agentHealthCheckPromise;
+let agentHealthConsecutiveFailures = 0;
+let agentHealthRetryTimer;
+let agentApiStatusText = "";
 const inMemoryRequestCooldowns = new Map();
 const requestHistoryCache = new Map();
 const historyStorageErrors = new Map();
@@ -270,8 +276,8 @@ function updateWalletUi() {
     !signedIn ||
     !agentApiConfigured ||
     !agentHealthReady ||
-    agentHealthCheckInProgress ||
     cooldownRemaining > 0 ||
+    isPreparingPayment ||
     isSubmitting;
   if (signedIn) {
     const connectedAccountId = accountId || "Wallet conectada";
@@ -282,14 +288,34 @@ function updateWalletUi() {
   if (cooldownRemaining > 0) {
     agentApiNote.textContent =
       `Esta cuenta ya envió una solicitud. El contrato permite una por hora; podrás pagar de nuevo en aproximadamente ${formatCooldown(cooldownRemaining)}.`;
+  } else if (agentApiStatusText) {
+    agentApiNote.textContent = agentApiStatusText;
   }
 }
 
+function setAgentApiStatusText(text) {
+  agentApiStatusText = text;
+  agentApiNote.textContent = text;
+}
+
+function scheduleAgentHealthRetry() {
+  if (agentHealthRetryTimer) return;
+  agentHealthRetryTimer = window.setTimeout(() => {
+    agentHealthRetryTimer = undefined;
+    void checkAgentHealth();
+  }, AGENT_HEALTH_RETRY_MS);
+}
+
+// Resolves to true only when this check actually reached a healthy agent.
+// Background re-checks never disable the pay button while they are in flight,
+// and a single transient failure after a good check keeps the last good state
+// (with a quick retry) instead of blocking payments for 30 seconds.
 function checkAgentHealth() {
   if (!agentApiConfigured) {
     agentHealthReady = false;
-    agentApiNote.textContent =
-      "La URL HTTPS del agente es un placeholder. Configúrala antes de habilitar pagos.";
+    setAgentApiStatusText(
+      "La URL HTTPS del agente es un placeholder. Configúrala antes de habilitar pagos.",
+    );
     showStatus("API del agente pendiente de despliegue", "warning");
     updateWalletUi();
     return Promise.resolve(false);
@@ -297,8 +323,8 @@ function checkAgentHealth() {
   if (agentHealthCheckPromise) return agentHealthCheckPromise;
 
   agentHealthCheckInProgress = true;
-  updateWalletUi();
   agentHealthCheckPromise = (async () => {
+    const wasReady = agentHealthReady;
     try {
       const response = await fetch(`${AGENT_API_URL}/health`, {
         mode: "cors",
@@ -313,8 +339,11 @@ function checkAgentHealth() {
         throw new Error("El servicio no confirmó que está disponible en NEAR testnet");
       }
       agentHealthReady = true;
-      agentApiNote.textContent = "API HTTPS del agente disponible · NEAR testnet.";
-      if (walletReady && !isSubmitting) {
+      agentHealthConsecutiveFailures = 0;
+      setAgentApiStatusText("API HTTPS del agente disponible · NEAR testnet.");
+      // Only replace the status label when recovering; otherwise a routine
+      // re-check would overwrite "Respuesta recibida" or similar every 30 s.
+      if (!wasReady && walletReady && !isSubmitting) {
         showStatus(
           walletSelector.isSignedIn()
             ? "Meteor Wallet conectada · testnet"
@@ -323,10 +352,18 @@ function checkAgentHealth() {
       }
       return true;
     } catch (error) {
+      agentHealthConsecutiveFailures += 1;
+      if (wasReady && agentHealthConsecutiveFailures < AGENT_HEALTH_FAILURES_BEFORE_BLOCK) {
+        console.warn("Fallo transitorio de /health; se reintenta en unos segundos:", error);
+        scheduleAgentHealthRetry();
+        return false;
+      }
       agentHealthReady = false;
-      agentApiNote.textContent =
-        `API HTTPS del agente no disponible: ${error.message}. El pago permanece deshabilitado.`;
-      showStatus("API del agente no disponible", "warning");
+      setAgentApiStatusText(
+        `API HTTPS del agente no disponible: ${error.message}. El pago permanece deshabilitado; se reintenta automáticamente.`,
+      );
+      if (!isSubmitting) showStatus("API del agente no disponible", "warning");
+      scheduleAgentHealthRetry();
       return false;
     } finally {
       agentHealthCheckInProgress = false;
@@ -335,6 +372,12 @@ function checkAgentHealth() {
     }
   })();
   return agentHealthCheckPromise;
+}
+
+async function ensureAgentHealthyBeforePayment() {
+  if (await checkAgentHealth()) return true;
+  await pause(1500);
+  return checkAgentHealth();
 }
 
 async function initializeWallet() {
@@ -491,7 +534,7 @@ async function pollAgentResult(requestId) {
 }
 
 async function submitQuery() {
-  if (isSubmitting || agentHealthCheckInProgress) return;
+  if (isSubmitting || isPreparingPayment) return;
   if (!agentApiConfigured) {
     showStatus("API del agente no configurada", "warning");
     showMessage(
@@ -524,7 +567,16 @@ async function submitQuery() {
     queryInput.focus();
     return;
   }
-  if (!(await checkAgentHealth())) {
+  isPreparingPayment = true;
+  updateWalletUi();
+  let agentHealthy = false;
+  try {
+    agentHealthy = await ensureAgentHealthyBeforePayment();
+  } finally {
+    isPreparingPayment = false;
+    updateWalletUi();
+  }
+  if (!agentHealthy) {
     showMessage(
       "La API HTTPS del agente no respondió correctamente en /health. No se envió ningún pago; inténtalo de nuevo cuando el agente esté disponible.",
     );
