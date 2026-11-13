@@ -108,6 +108,29 @@ textarea:focus, input:focus { border-color: rgba(102, 228, 230, .65); outline: n
 .transaction-details dd { overflow-wrap: anywhere; margin: 0; color: #b8c8dd; font: 10px var(--mono); }
 .transaction-details a { color: var(--cyan); text-decoration: none; }
 .transaction-details a:hover { text-decoration: underline; }
+
+.status-label[data-state="pending"] { color: var(--cyan); border-color: rgba(102, 228, 230, .28); }
+.status-label[data-state="success"] { color: var(--green); border-color: rgba(109, 224, 176, .28); }
+.status-label[data-state="warning"] { color: #ffb4b4; border-color: rgba(255, 119, 119, .28); }
+
+.result-progress { margin: 0 0 18px; padding: 14px 14px 12px; border: 1px solid var(--line); border-radius: 12px; background: rgba(4, 12, 23, .4); }
+.progress-stages { display: flex; flex-wrap: wrap; gap: 8px 0; margin: 0; padding: 0; list-style: none; }
+.progress-stage { position: relative; display: flex; flex-direction: column; gap: 6px; flex: 1 1 0; min-width: 92px; padding: 0 8px 0 0; color: #66778f; font: 500 9px var(--mono); letter-spacing: .04em; text-transform: uppercase; }
+.progress-stage:not(:last-child)::after { content: ""; position: absolute; left: 18px; right: 6px; top: 7px; height: 1px; background: rgba(165, 190, 225, .16); }
+.progress-stage-dot { width: 15px; height: 15px; border: 1px solid rgba(165, 190, 225, .28); border-radius: 50%; background: rgba(8, 17, 31, .9); box-shadow: 0 0 0 3px rgba(8, 17, 31, .9); z-index: 1; }
+.progress-stage[data-state="done"] { color: var(--green); }
+.progress-stage[data-state="done"] .progress-stage-dot { border-color: rgba(109, 224, 176, .7); background: var(--green); }
+.progress-stage[data-state="current"] { color: var(--cyan); }
+.progress-stage[data-state="current"] .progress-stage-dot { border-color: var(--cyan); background: rgba(102, 228, 230, .2); box-shadow: 0 0 0 3px rgba(8, 17, 31, .9), 0 0 10px rgba(102, 228, 230, .45); }
+.progress-stage[data-state="error"] { color: #ff9a9a; }
+.progress-stage[data-state="error"] .progress-stage-dot { border-color: #ff9a9a; background: #ff9a9a; }
+.progress-live { display: flex; align-items: center; gap: 9px; margin: 12px 0 0; color: #d9e7f7; font-size: 12px; }
+.progress-spinner { width: 12px; height: 12px; flex: 0 0 12px; border: 2px solid rgba(102, 228, 230, .22); border-top-color: var(--cyan); border-radius: 50%; animation: progress-spin .8s linear infinite; }
+.progress-meta { margin: 7px 0 0; color: #718198; font: 9px var(--mono); }
+.history-stage { margin: 0 0 8px; color: #91a1bb; font: 9px var(--mono); }
+
+@keyframes progress-spin { to { transform: rotate(360deg); } }
+
 .history-section { max-width: 790px; margin: 34px auto 0; }
 .history-wallet { max-width: 55%; overflow-wrap: anywhere; color: #8293ac; font: 10px var(--mono); text-align: right; }
 .history-card { overflow: hidden; border: 1px solid var(--line); border-radius: 15px; background: linear-gradient(145deg, rgba(17, 31, 50, .96), rgba(11, 23, 39, .96)); }
@@ -150,6 +173,7 @@ textarea:focus, input:focus { border-color: rgba(102, 228, 230, .65); outline: n
   .section-heading { align-items: center; }
   h2 { font-size: 19px; }
   .transaction-details { grid-template-columns: 1fr; }
+  .progress-stage { min-width: 46%; padding-bottom: 8px; }
   .history-entry { padding: 15px; }
 }
 

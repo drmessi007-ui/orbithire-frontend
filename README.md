@@ -8,7 +8,7 @@ Static HTML, CSS, and JavaScript for GitHub Pages. No bundler or build step is r
 2. The OrbitHire contract records the request ID and query hash. The query itself is public in the NEAR transaction arguments; do not enter sensitive information.
 3. A persistent off-chain agent scans finalized testnet blocks, retrieves and validates the transaction query, runs Jev and the relevant NOAA/CelesTrak lookup, then submits the report receipt.
 4. Right after payment the frontend sends a fire-and-forget `POST /api/notify` (`request_id`, `tx_hash`, `sender_account_id`); the agent verifies the transaction on-chain, and its block scan remains the fallback.
-5. The frontend polls the agent's public read-only HTTPS API at `/api/requests/{request_id}`.
+5. The frontend polls the agent's public read-only HTTPS API at `/api/requests/{request_id}` and shows the live stage in the result panel (Pago enviado → Verificando en la cadena → En cola → Procesando → Registrando recibo → Completado).
 
 ### Rate limit and history
 

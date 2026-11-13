@@ -25,6 +25,20 @@ const PENDING_RESUME_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const PENDING_UNSIGNED_STALE_MS = 15 * 60 * 1000;
 const HISTORY_RESUME_INTERVAL_MS = 20000;
 const HISTORY_RESULT_MAX_CHARS = 1500;
+const RESULT_PROGRESS_STEPS = [
+  ["pago_enviado", "Pago enviado"],
+  ["verificando", "Verificando en la cadena"],
+  ["en_cola", "En cola"],
+  ["procesando", "Procesando"],
+  ["registrando", "Registrando recibo"],
+  ["completado", "Completado"],
+];
+const RESULT_PROGRESS_LABELS = Object.fromEntries(RESULT_PROGRESS_STEPS);
+RESULT_PROGRESS_LABELS.failed = "Error";
+RESULT_PROGRESS_LABELS.under_review = "En revisión";
+const TERMINAL_PROGRESS_STAGES = new Set(["completado", "failed", "under_review"]);
+const REFUND_HINT =
+  "La solicitud permanece abierta en el contrato y se puede reembolsar después del plazo.";
 
 const walletButton = document.querySelector("#wallet-button");
 const submitButton = document.querySelector("#submit-button");
@@ -35,6 +49,11 @@ const statusLabel = document.querySelector("#status-label");
 const emptyState = document.querySelector("#empty-state");
 const resultContent = document.querySelector("#result-content");
 const resultCopy = document.querySelector("#result-copy");
+const resultProgress = document.querySelector("#result-progress");
+const progressStages = document.querySelector("#progress-stages");
+const progressLive = document.querySelector("#progress-live");
+const progressLiveText = document.querySelector("#progress-live-text");
+const progressMeta = document.querySelector("#progress-meta");
 const requestIdLabel = document.querySelector("#request-id");
 const transactionLink = document.querySelector("#transaction-link");
 const historyWallet = document.querySelector("#history-wallet");
@@ -69,6 +88,12 @@ const renotifiedRequests = new Set();
 let historyResumeTimer;
 let historyResumeRunning = false;
 let uiAccountId = null;
+let resultProgressTimer;
+let resultProgressRequestId = "";
+let resultProgressAccountId = "";
+let resultProgressStage = "";
+let resultProgressStartedAt = 0;
+let resultProgressUpdatedAt = 0;
 const historyStorageErrors = new Map();
 const agentApiConfigured = isValidAgentApiUrl();
 
@@ -98,15 +123,163 @@ function showMessage(message, requestId = "", transactionHash = "") {
     transactionLink.removeAttribute("href");
     transactionLink.hidden = true;
   }
+  if (!requestId || resultProgressRequestId !== requestId) hideResultProgress();
 }
 
 function resetResultPanel() {
+  hideResultProgress();
   emptyState.hidden = false;
   resultContent.hidden = true;
   resultCopy.textContent = "";
   requestIdLabel.textContent = "";
   transactionLink.removeAttribute("href");
   transactionLink.hidden = true;
+}
+
+function hideResultProgress() {
+  if (resultProgressTimer) {
+    window.clearInterval(resultProgressTimer);
+    resultProgressTimer = undefined;
+  }
+  resultProgressRequestId = "";
+  resultProgressAccountId = "";
+  resultProgressStage = "";
+  resultProgressStartedAt = 0;
+  resultProgressUpdatedAt = 0;
+  if (resultProgress) resultProgress.hidden = true;
+  if (progressStages) progressStages.replaceChildren();
+  if (progressLive) progressLive.hidden = true;
+  if (progressMeta) progressMeta.hidden = true;
+}
+
+function formatElapsed(ms) {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (minutes === 0) return `${totalSeconds} s`;
+  return `${minutes} min ${String(seconds).padStart(2, "0")} s`;
+}
+
+function formatClock(timestamp) {
+  return new Date(timestamp).toLocaleTimeString("es-CL", {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
+function progressStageFromAgent(result, { hasTransactionHash = false, localStage = "" } = {}) {
+  const status = result?.status;
+  if (status === "queued") return "en_cola";
+  if (status === "processing" || status === "retrying") return "procesando";
+  if (status === "submitting") return "registrando";
+  if (status === "completed") return "completado";
+  if (status === "failed") return "failed";
+  if (status === "under_review") return "under_review";
+  if (status === "waiting_for_event" || status === "not_found") {
+    return hasTransactionHash ? "verificando" : "pago_enviado";
+  }
+  if (RESULT_PROGRESS_LABELS[localStage]) return localStage;
+  return hasTransactionHash ? "pago_enviado" : "";
+}
+
+function failedResultMessage(result) {
+  const message =
+    (result && agentResultMessage(result)) || "No se pudo completar la consulta.";
+  return /reembol/i.test(message) ? message : `${message} ${REFUND_HINT}`;
+}
+
+function canPaintRequest(accountId, requestId) {
+  return (
+    Boolean(accountId) &&
+    getActiveAccountId() === accountId &&
+    (!resultProgressRequestId || resultProgressRequestId === requestId)
+  );
+}
+
+function refreshProgressMeta() {
+  if (!progressMeta || !resultProgressStartedAt) return;
+  progressMeta.hidden = false;
+  const elapsed = formatElapsed(Date.now() - resultProgressStartedAt);
+  const updated = formatClock(resultProgressUpdatedAt || resultProgressStartedAt);
+  progressMeta.textContent = `Transcurridos ${elapsed} · última actualización a las ${updated}`;
+}
+
+function renderProgressSteps(stage) {
+  if (!progressStages) return;
+  const happyIndex = RESULT_PROGRESS_STEPS.findIndex(([id]) => id === stage);
+  const currentIndex =
+    stage === "failed" || stage === "under_review"
+      ? Math.max(
+          0,
+          RESULT_PROGRESS_STEPS.findIndex(([id]) => id === "registrando"),
+        )
+      : happyIndex;
+  progressStages.replaceChildren();
+  for (const [index, [id, label]] of RESULT_PROGRESS_STEPS.entries()) {
+    const item = document.createElement("li");
+    item.className = "progress-stage";
+    item.dataset.stage = id;
+    if (stage === "failed" && index === currentIndex) item.dataset.state = "error";
+    else if (stage === "completado" || (happyIndex !== -1 && index < happyIndex) || (stage === "under_review" && index <= currentIndex)) {
+      item.dataset.state = "done";
+    } else if (happyIndex !== -1 && index === happyIndex) {
+      item.dataset.state = "current";
+    } else {
+      item.dataset.state = "todo";
+    }
+    const dot = document.createElement("span");
+    dot.className = "progress-stage-dot";
+    dot.setAttribute("aria-hidden", "true");
+    const text = document.createElement("span");
+    text.textContent = label;
+    item.append(dot, text);
+    progressStages.append(item);
+  }
+}
+
+function showResultProgress({
+  accountId,
+  requestId,
+  transactionHash = "",
+  stage,
+  message = "",
+  startedAt,
+  updatedAt,
+} = {}) {
+  if (!resultProgress || !requestId || !canPaintRequest(accountId, requestId)) return;
+  emptyState.hidden = true;
+  resultContent.hidden = false;
+  resultProgress.hidden = false;
+  resultProgressRequestId = requestId;
+  resultProgressAccountId = accountId || "";
+  resultProgressStage = stage;
+  resultProgressStartedAt = startedAt || resultProgressStartedAt || Date.now();
+  resultProgressUpdatedAt = updatedAt || Date.now();
+  requestIdLabel.textContent = requestId || "—";
+  if (transactionHash) {
+    transactionLink.href = `${EXPLORER_URL}${encodeURIComponent(transactionHash)}`;
+    transactionLink.hidden = false;
+  }
+  renderProgressSteps(stage);
+  const inFlight = !TERMINAL_PROGRESS_STAGES.has(stage);
+  if (progressLive) {
+    progressLive.hidden = !inFlight;
+    if (inFlight && progressLiveText) {
+      const label = RESULT_PROGRESS_LABELS[stage] || "En proceso";
+      progressLiveText.textContent = `Cargando el resultado… ${label}`;
+    }
+  }
+  if (message) resultCopy.textContent = message;
+  refreshProgressMeta();
+  if (inFlight) {
+    if (!resultProgressTimer) {
+      resultProgressTimer = window.setInterval(refreshProgressMeta, 1000);
+    }
+  } else if (resultProgressTimer) {
+    window.clearInterval(resultProgressTimer);
+    resultProgressTimer = undefined;
+  }
 }
 
 function getActiveAccountId() {
@@ -433,6 +606,9 @@ function renderHistory(accountId) {
     status.className = "history-status";
     status.dataset.state = entry.status;
     status.textContent = statusLabels[entry.status];
+    if (entry.status === "pending" && RESULT_PROGRESS_LABELS[entry.stage]) {
+      status.textContent = `Pendiente · ${RESULT_PROGRESS_LABELS[entry.stage]}`;
+    }
     const date = document.createElement("time");
     date.className = "history-date";
     date.dateTime = entry.date;
@@ -450,6 +626,18 @@ function renderHistory(accountId) {
     requestId.className = "history-id";
     requestId.textContent = `Request ID: ${entry.requestId}`;
     item.append(header, query, requestId);
+
+    if (entry.status === "pending" && RESULT_PROGRESS_LABELS[entry.stage]) {
+      const stageLine = document.createElement("p");
+      stageLine.className = "history-stage";
+      const updated = entry.stageUpdatedAt || entry.date;
+      const parsedUpdate = new Date(updated);
+      const updateLabel = Number.isNaN(parsedUpdate.getTime())
+        ? ""
+        : ` · actualizado a las ${parsedUpdate.toLocaleTimeString("es-CL", { hour: "2-digit", minute: "2-digit", second: "2-digit" })}`;
+      stageLine.textContent = `Etapa: ${RESULT_PROGRESS_LABELS[entry.stage]}${updateLabel}`;
+      item.append(stageLine);
+    }
 
     if (typeof entry.resultMessage === "string" && entry.resultMessage) {
       const resultText = document.createElement("p");
@@ -516,9 +704,13 @@ async function fetchAgentRequestStatus(requestId) {
       `${AGENT_API_URL}/api/requests/${encodeURIComponent(requestId)}`,
       { mode: "cors", cache: "no-store", signal: AbortSignal.timeout(5000) },
     );
-    if (response.status === 404) return { status: "not_found" };
+    const result = await response.json().catch(() => null);
+    if (response.status === 404) {
+      return result && result.status === "waiting_for_event"
+        ? result
+        : { status: "not_found" };
+    }
     if (!response.ok) return null;
-    const result = await response.json();
     return result && typeof result.status === "string" ? result : null;
   } catch {
     return null;
@@ -580,12 +772,45 @@ async function resumePendingHistory(accountId) {
     for (const entry of pendingEntries) {
       if (getActiveAccountId() !== accountId) return;
       const result = await fetchAgentRequestStatus(entry.requestId);
+      const stage = progressStageFromAgent(result, {
+        hasTransactionHash: Boolean(entry.transactionHash),
+        localStage: entry.stage,
+      });
+      const stageUpdatedAt = new Date().toISOString();
       if (result && FINAL_RESULT_STATUSES.has(result.status)) {
+        const resultMessage =
+          result.status === "failed"
+            ? truncateResult(failedResultMessage(result))
+            : truncateResult(agentResultMessage(result));
         updateHistoryEntry(accountId, entry.requestId, {
           status: result.status,
-          resultMessage: truncateResult(agentResultMessage(result)),
+          resultMessage,
+          stage,
+          stageUpdatedAt,
         });
+        if (canPaintRequest(accountId, entry.requestId) || resultProgressRequestId === entry.requestId) {
+          showResultProgress({
+            accountId,
+            requestId: entry.requestId,
+            transactionHash: entry.transactionHash,
+            stage,
+            message: resultMessage,
+            startedAt: Date.parse(entry.date) || Date.now(),
+            updatedAt: Date.now(),
+          });
+          showStatus(
+            result.status === "completed"
+              ? "Respuesta recibida"
+              : result.status === "under_review"
+                ? "En revisión humana"
+                : "Revisar agente",
+            result.status === "completed" ? "success" : "warning",
+          );
+        }
         continue;
+      }
+      if (stage) {
+        updateHistoryEntry(accountId, entry.requestId, { stage, stageUpdatedAt });
       }
       if (entry.transactionHash) {
         stillPending = true;
@@ -594,6 +819,29 @@ async function resumePendingHistory(accountId) {
         if (agentHasNotSeenIt && !renotifiedRequests.has(entry.requestId)) {
           renotifiedRequests.add(entry.requestId);
           notifyAgent(entry.requestId, entry.transactionHash, accountId);
+        }
+        if (canPaintRequest(accountId, entry.requestId)) {
+          showResultProgress({
+            accountId,
+            requestId: entry.requestId,
+            transactionHash: entry.transactionHash,
+            stage: stage || "verificando",
+            message:
+              (result && result.message) ||
+              "Pago confirmado en NEAR testnet. El agente procesará la consulta; el historial se actualizará solo.",
+            startedAt: Date.parse(entry.date) || Date.now(),
+            updatedAt: Date.now(),
+          });
+          showStatus(
+            stage === "en_cola"
+              ? "Consulta en cola del agente…"
+              : stage === "procesando"
+                ? "Procesando consulta…"
+                : stage === "registrando"
+                  ? "Registrando recibo en la cadena…"
+                  : "Pago confirmado · esperando agente",
+            "pending",
+          );
         }
         continue;
       }
@@ -615,6 +863,83 @@ async function resumePendingHistory(accountId) {
     historyResumeRunning = false;
   }
   if (stillPending && getActiveAccountId() === accountId) scheduleHistoryResume();
+}
+
+function collectTransactionHashes(source) {
+  const hashes = [];
+  const push = (value) => {
+    if (typeof value === "string") {
+      for (const part of value.split(/[,\s]+/u)) {
+        const hash = part.trim();
+        if (hash && !hashes.includes(hash)) hashes.push(hash);
+      }
+      return;
+    }
+    if (Array.isArray(value)) value.forEach(push);
+  };
+  if (typeof source === "string" || Array.isArray(source)) {
+    push(source);
+    return hashes;
+  }
+  if (!source || typeof source !== "object") return hashes;
+  push(source.transaction?.hash);
+  push(source.transaction_outcome?.id);
+  push(source.transactionOutcome?.id);
+  push(source.transaction_hash);
+  push(source.transactionHash);
+  push(source.transactionHashes);
+  push(source.transaction_hashes);
+  return hashes;
+}
+
+function extractRequestServiceArgs(tx) {
+  const call = tx?.transaction?.actions
+    ?.map((action) => action?.FunctionCall)
+    .find((functionCall) => functionCall?.method_name === "request_service");
+  if (!call || tx.transaction.receiver_id !== CONTRACT_ID) return null;
+  try {
+    const args = JSON.parse(new TextDecoder().decode(base64ToBytes(call.args)));
+    return typeof args.request_id === "string" ? args : null;
+  } catch {
+    return null;
+  }
+}
+
+async function resolveTransactionHashForRequest(candidates, requestId, accountId) {
+  for (const hash of candidates) {
+    try {
+      const tx = await fetchTransaction(hash, accountId);
+      const args = extractRequestServiceArgs(tx);
+      if (args?.request_id === requestId && !tx.status?.Failure) {
+        return { hash, tx, args };
+      }
+    } catch (error) {
+      console.warn("No se pudo verificar un hash de transacción devuelto por la wallet:", error);
+    }
+  }
+  return null;
+}
+
+async function pickTransactionHashForRequest(candidates, requestId, accountId) {
+  if (!Array.isArray(candidates) || candidates.length === 0) {
+    return { hash: "", verified: false };
+  }
+  if (candidates.length === 1) {
+    try {
+      const tx = await fetchTransaction(candidates[0], accountId);
+      const args = extractRequestServiceArgs(tx);
+      if (args?.request_id === requestId && !tx.status?.Failure) {
+        return { hash: candidates[0], verified: true, tx, args };
+      }
+      return { hash: "", verified: false, mismatch: true };
+    } catch {
+      return { hash: candidates[0], verified: false };
+    }
+  }
+  const matched = await resolveTransactionHashForRequest(candidates, requestId, accountId);
+  return matched
+    ? { hash: matched.hash, verified: true, tx: matched.tx, args: matched.args }
+    : { hash: "", verified: false };
 }
 
 async function fetchTransaction(transactionHash, accountId) {
@@ -669,21 +994,21 @@ async function handleWalletRedirect() {
     return;
   }
 
-  for (const transactionHash of hashes.split(",").map((hash) => hash.trim()).filter(Boolean)) {
+  for (const transactionHash of collectTransactionHashes(hashes)) {
     try {
       const tx = await fetchTransaction(transactionHash, accountId);
-      const call = tx.transaction?.actions
-        ?.map((action) => action?.FunctionCall)
-        .find((functionCall) => functionCall?.method_name === "request_service");
-      if (!call || tx.transaction.receiver_id !== CONTRACT_ID) continue;
-      const args = JSON.parse(new TextDecoder().decode(base64ToBytes(call.args)));
-      if (typeof args.request_id !== "string") continue;
+      const args = extractRequestServiceArgs(tx);
+      if (!args) continue;
       const succeeded = !tx.status?.Failure;
       const existing = getRequestHistory(accountId).find((entry) => entry.requestId === args.request_id);
+      const alreadyFinal = existing && FINAL_RESULT_STATUSES.has(existing.status);
+      const stage = succeeded ? "pago_enviado" : "failed";
+      const stageUpdatedAt = new Date().toISOString();
       if (existing) {
         updateHistoryEntry(accountId, args.request_id, {
           transactionHash,
           status: succeeded ? existing.status : "failed",
+          ...(alreadyFinal ? {} : { stage, stageUpdatedAt }),
         });
       } else {
         addHistoryEntry({
@@ -693,18 +1018,25 @@ async function handleWalletRedirect() {
           status: succeeded ? "pending" : "failed",
           transactionHash,
           date: new Date().toISOString(),
+          stage,
+          stageUpdatedAt,
         });
       }
-      if (succeeded) {
+      if (succeeded && !alreadyFinal) {
         recordRequestCooldown(accountId);
         notifyAgent(args.request_id, transactionHash, accountId);
         renotifiedRequests.add(args.request_id);
-        showStatus("Pago confirmado · esperando agente", "success");
-        showMessage(
-          "Pago confirmado en NEAR testnet. El agente procesará la consulta; el historial se actualizará solo.",
-          args.request_id,
+        showStatus("Pago confirmado · esperando agente", "pending");
+        showResultProgress({
+          accountId,
+          requestId: args.request_id,
           transactionHash,
-        );
+          stage: "pago_enviado",
+          message:
+            "Pago confirmado en NEAR testnet. El agente observa la cadena y procesará la consulta automáticamente.",
+          startedAt: Date.now(),
+        });
+        void watchRequestResult(args.request_id, accountId, transactionHash);
       }
     } catch (error) {
       console.warn("No se pudo procesar la transacción devuelta por la wallet:", error);
@@ -941,19 +1273,28 @@ function connectWallet() {
 }
 
 function getTransactionHash(outcome) {
-  return (
-    outcome?.transaction?.hash ||
-    outcome?.transaction_outcome?.id ||
-    outcome?.transactionOutcome?.id ||
-    ""
-  );
+  return collectTransactionHashes(outcome)[0] || "";
+}
+
+function statusLabelForStage(stage, fallbackStatus) {
+  if (stage === "en_cola") return "Consulta en cola del agente…";
+  if (stage === "procesando") return "Procesando consulta…";
+  if (stage === "registrando") return "Registrando recibo en la cadena…";
+  if (stage === "verificando") return "Verificando el pago en la cadena…";
+  if (stage === "pago_enviado") return "Pago confirmado · esperando agente";
+  if (stage === "completado") return "Respuesta recibida";
+  if (stage === "under_review") return "En revisión humana";
+  if (stage === "failed") return "Revisar agente";
+  if (fallbackStatus === "queued") return "Consulta en cola del agente…";
+  if (fallbackStatus === "pending") return "Agente procesando";
+  return "Procesando consulta…";
 }
 
 function pause(ms) {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
-async function pollAgentResult(requestId, accountId) {
+async function pollAgentResult(requestId, accountId, transactionHash = "", startedAt = Date.now()) {
   let consecutiveErrors = 0;
   for (let attempt = 0; attempt < RESULT_POLL_ATTEMPTS; attempt += 1) {
     await pause(RESULT_POLL_INTERVAL_MS);
@@ -971,22 +1312,109 @@ async function pollAgentResult(requestId, accountId) {
       continue;
     }
     consecutiveErrors = 0;
-    if (result.status === "not_found") continue;
-    if (FINAL_RESULT_STATUSES.has(result.status)) {
-      return { status: result.status, message: agentResultMessage(result) };
+    const stage = progressStageFromAgent(result, { hasTransactionHash: Boolean(transactionHash) });
+    const finalMessage =
+      result.status === "failed" ? failedResultMessage(result) : agentResultMessage(result);
+    if (stage) {
+      updateHistoryEntry(accountId, requestId, {
+        stage,
+        stageUpdatedAt: new Date().toISOString(),
+        ...(FINAL_RESULT_STATUSES.has(result.status)
+          ? {}
+          : result.message
+            ? { resultMessage: truncateResult(result.message) }
+            : {}),
+      });
     }
-    if (getActiveAccountId() === accountId) {
-      showStatus(
-        result.status === "queued" ? "Consulta en cola del agente…" : "Procesando consulta…",
-        "pending",
-      );
+    if (canPaintRequest(accountId, requestId) || resultProgressRequestId === requestId) {
+      if (result.status !== "not_found" || transactionHash) {
+        showResultProgress({
+          accountId,
+          requestId,
+          transactionHash,
+          stage: stage || "verificando",
+          message:
+            FINAL_RESULT_STATUSES.has(result.status)
+              ? finalMessage
+              : result.message ||
+                "Pago confirmado en NEAR testnet. El agente observa la cadena y procesará la consulta automáticamente.",
+          startedAt,
+          updatedAt: Date.now(),
+        });
+      }
+      if (FINAL_RESULT_STATUSES.has(result.status)) {
+        showStatus(
+          statusLabelForStage(stage, result.status),
+          result.status === "completed" ? "success" : "warning",
+        );
+      } else if (result.status !== "not_found" || transactionHash) {
+        showStatus(statusLabelForStage(stage, result.status), "pending");
+      }
+    }
+    if (FINAL_RESULT_STATUSES.has(result.status)) {
+      return { status: result.status, message: finalMessage, stage };
     }
   }
   return {
     status: "pending",
+    stage: resultProgressRequestId === requestId ? resultProgressStage : "verificando",
     message:
       "El agente todavía procesa la solicitud. El historial seguirá revisándola automáticamente; conserva el request ID y el hash y no vuelvas a pagar esta consulta.",
   };
+}
+
+async function watchRequestResult(requestId, accountId, transactionHash, startedAt = Date.now()) {
+  if (!requestId || activeResultPolls.has(requestId)) return;
+  activeResultPolls.add(requestId);
+  try {
+    const result = await pollAgentResult(requestId, accountId, transactionHash, startedAt);
+    const historyStatus = FINAL_RESULT_STATUSES.has(result.status) ? result.status : "pending";
+    const stage =
+      result.stage ||
+      progressStageFromAgent(result, { hasTransactionHash: Boolean(transactionHash) });
+    updateHistoryEntry(accountId, requestId, {
+      status: historyStatus,
+      transactionHash,
+      stage: stage || undefined,
+      stageUpdatedAt: new Date().toISOString(),
+      ...(historyStatus === "pending" ? {} : { resultMessage: truncateResult(result.message) }),
+    });
+    if (historyStatus === "pending") scheduleHistoryResume();
+    if (canPaintRequest(accountId, requestId) || resultProgressRequestId === requestId) {
+      showStatus(
+        result.status === "unreachable"
+          ? "Revisar agente"
+          : statusLabelForStage(stage, result.status),
+        result.status === "completed" ? "success" : result.status === "pending" ? "pending" : "warning",
+      );
+      showResultProgress({
+        accountId,
+        requestId,
+        transactionHash,
+        stage: historyStatus === "pending" ? stage || "verificando" : historyStatus === "failed" ? "failed" : stage || historyStatus,
+        message: result.message,
+        startedAt,
+        updatedAt: Date.now(),
+      });
+      if (result.message) {
+        // Keep request/tx metadata in the panel even after the poll ends.
+        showMessage(result.message, requestId, transactionHash);
+        if (stage || historyStatus === "pending") {
+          showResultProgress({
+            accountId,
+            requestId,
+            transactionHash,
+            stage: historyStatus === "pending" ? stage || "verificando" : historyStatus === "failed" ? "failed" : stage || historyStatus,
+            message: result.message,
+            startedAt,
+            updatedAt: Date.now(),
+          });
+        }
+      }
+    }
+  } finally {
+    activeResultPolls.delete(requestId);
+  }
 }
 
 async function submitQuery() {
@@ -1054,6 +1482,8 @@ async function submitQuery() {
     status: "pending",
     transactionHash: "",
     date: new Date().toISOString(),
+    stage: "pago_enviado",
+    stageUpdatedAt: new Date().toISOString(),
   });
   isSubmitting = true;
   updateWalletUi();
@@ -1084,52 +1514,91 @@ async function submitQuery() {
         ),
       ],
     });
-    transactionHash = getTransactionHash(outcome);
     const chainFailure = outcome?.status?.Failure;
     if (chainFailure) {
+      transactionHash = getTransactionHash(outcome);
       const failureError = new Error(
         `La transacción falló en la cadena: ${JSON.stringify(chainFailure)}`,
       );
       failureError.chainFailure = true;
       throw failureError;
     }
+    const picked = await pickTransactionHashForRequest(
+      collectTransactionHashes(outcome),
+      requestId,
+      accountId,
+    );
+    transactionHash = picked.hash;
+    if (picked.mismatch) {
+      console.warn(
+        "Ningún hash devuelto por la wallet coincide con el request_id de esta consulta; no se envía la notificación.",
+      );
+    }
     recordRequestCooldown(accountId);
-    updateHistoryEntry(accountId, requestId, { transactionHash });
+    updateHistoryEntry(accountId, requestId, {
+      transactionHash,
+      stage: "pago_enviado",
+      stageUpdatedAt: new Date().toISOString(),
+    });
     paymentConfirmed = true;
-    notifyAgent(requestId, transactionHash, accountId);
-    renotifiedRequests.add(requestId);
+    if (transactionHash) {
+      notifyAgent(requestId, transactionHash, accountId);
+      renotifiedRequests.add(requestId);
+    }
     updateWalletUi();
-    statusForAccount("Pago confirmado · esperando agente", "success");
+    statusForAccount("Pago confirmado · esperando agente", "pending");
     messageForAccount(
       "Pago confirmado en NEAR testnet. El agente observa la cadena y procesará la consulta automáticamente.",
       requestId,
       transactionHash,
     );
+    showResultProgress({
+      accountId,
+      requestId,
+      transactionHash,
+      stage: "pago_enviado",
+      message:
+        "Pago confirmado en NEAR testnet. El agente observa la cadena y procesará la consulta automáticamente.",
+      startedAt: Date.now(),
+    });
 
-    const result = await pollAgentResult(requestId, accountId);
-    const historyStatus =
-      result.status === "completed" ||
-      result.status === "failed" ||
-      result.status === "under_review"
-        ? result.status
-        : "pending";
+    const paidAt = Date.now();
+    const result = await pollAgentResult(requestId, accountId, transactionHash, paidAt);
+    const historyStatus = FINAL_RESULT_STATUSES.has(result.status) ? result.status : "pending";
+    const stage =
+      result.stage ||
+      progressStageFromAgent(result, { hasTransactionHash: Boolean(transactionHash) });
     updateHistoryEntry(accountId, requestId, {
       status: historyStatus,
       transactionHash,
+      stage: stage || undefined,
+      stageUpdatedAt: new Date().toISOString(),
       ...(historyStatus === "pending" ? {} : { resultMessage: truncateResult(result.message) }),
     });
     if (historyStatus === "pending") scheduleHistoryResume();
     statusForAccount(
-      result.status === "completed"
-        ? "Respuesta recibida"
-        : result.status === "under_review"
-          ? "En revisión humana"
-          : result.status === "pending"
-            ? "Agente procesando"
-            : "Revisar agente",
+      result.status === "unreachable"
+        ? "Revisar agente"
+        : statusLabelForStage(stage, result.status),
       result.status === "completed" ? "success" : result.status === "pending" ? "pending" : "warning",
     );
     messageForAccount(result.message, requestId, transactionHash);
+    if (getActiveAccountId() === accountId) {
+      showResultProgress({
+        accountId,
+        requestId,
+        transactionHash,
+        stage:
+          historyStatus === "pending"
+            ? stage || "verificando"
+            : historyStatus === "failed"
+              ? "failed"
+              : stage || historyStatus,
+        message: result.message,
+        startedAt: paidAt,
+        updatedAt: Date.now(),
+      });
+    }
   } catch (error) {
     const errorMessage = error.message || String(error);
     const rateLimited = /rate limit exceeded/i.test(errorMessage);
