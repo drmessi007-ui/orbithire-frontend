@@ -830,7 +830,8 @@ function checkAgentHealth() {
         `API HTTPS del agente no disponible: ${error.message}. El pago permanece deshabilitado; se reintenta automáticamente.`,
       );
       if (!isSubmitting) showStatus("API del agente no disponible", "warning");
-      scheduleAgentHealthRetry();
+      // Retry quickly a few times, then fall back to the 30 s interval.
+      if (agentHealthConsecutiveFailures < 4) scheduleAgentHealthRetry();
       return false;
     } finally {
       agentHealthCheckInProgress = false;
