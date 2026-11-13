@@ -11,6 +11,11 @@ const AGENT_HEALTH_POLL_INTERVAL_MS = 30000;
 const AGENT_HEALTH_RETRY_MS = 5000;
 const AGENT_HEALTH_FAILURES_BEFORE_BLOCK = 2;
 const REQUEST_RATE_LIMIT_MS = 60 * 60 * 1000;
+// The contract has no view method for the per-account rate limit, but its
+// storage is small and public: key 0x01 + borsh(account_id) holds the last
+// successful request_service timestamp (u64 ns) and STATE holds the window.
+const RATE_LIMIT_STATE_KEY_PREFIX = 0x01;
+const CHAIN_FINALITY_GRACE_MS = 30000;
 const REQUEST_COOLDOWN_STORAGE_PREFIX = "orbithire:request-cooldown:";
 const REQUEST_HISTORY_STORAGE_PREFIX = "orbithire:request-history:";
 const MAX_HISTORY_ENTRIES = 100;
@@ -47,6 +52,12 @@ let agentHealthConsecutiveFailures = 0;
 let agentHealthRetryTimer;
 let agentApiStatusText = "";
 const inMemoryRequestCooldowns = new Map();
+const chainCooldowns = new Map();
+const chainCooldownRequests = new Set();
+let rateLimitWindowMs = REQUEST_RATE_LIMIT_MS;
+let rateLimitWindowLoaded = false;
+let cooldownTimer;
+let cooldownAccountId = null;
 const requestHistoryCache = new Map();
 const historyStorageErrors = new Map();
 const agentApiConfigured = isValidAgentApiUrl();
@@ -79,26 +90,26 @@ function showMessage(message, requestId = "", transactionHash = "") {
   }
 }
 
-function getRequestCooldownUntil(accountId) {
-  if (!accountId) return 0;
-
+function readLocalCooldownUntil(accountId) {
   const memoryCooldown = inMemoryRequestCooldowns.get(accountId) || 0;
+  let storedCooldown = 0;
   try {
-    const storedCooldown = Number(
+    const stored = Number(
       window.localStorage.getItem(`${REQUEST_COOLDOWN_STORAGE_PREFIX}${accountId}`),
     );
-    if (Number.isFinite(storedCooldown) && storedCooldown > Date.now()) {
-      return Math.max(memoryCooldown, storedCooldown);
+    if (Number.isFinite(stored) && stored > Date.now()) {
+      storedCooldown = stored;
+    } else {
+      window.localStorage.removeItem(`${REQUEST_COOLDOWN_STORAGE_PREFIX}${accountId}`);
     }
-    window.localStorage.removeItem(`${REQUEST_COOLDOWN_STORAGE_PREFIX}${accountId}`);
   } catch (error) {
     console.warn("No se pudo leer el límite local de solicitudes:", error);
   }
-  return memoryCooldown > Date.now() ? memoryCooldown : 0;
+  const localCooldown = Math.max(memoryCooldown, storedCooldown);
+  return localCooldown > Date.now() ? localCooldown : 0;
 }
 
-function recordRequestCooldown(accountId) {
-  const cooldownUntil = Date.now() + REQUEST_RATE_LIMIT_MS;
+function storeLocalCooldown(accountId, cooldownUntil) {
   inMemoryRequestCooldowns.set(accountId, cooldownUntil);
   try {
     window.localStorage.setItem(
@@ -110,11 +121,189 @@ function recordRequestCooldown(accountId) {
   }
 }
 
+function clearLocalCooldown(accountId) {
+  inMemoryRequestCooldowns.delete(accountId);
+  try {
+    window.localStorage.removeItem(`${REQUEST_COOLDOWN_STORAGE_PREFIX}${accountId}`);
+  } catch (error) {
+    console.warn("No se pudo limpiar el límite local de solicitudes:", error);
+  }
+}
+
+function getRequestCooldownUntil(accountId) {
+  if (!accountId) return 0;
+  const now = Date.now();
+  const localCooldown = readLocalCooldownUntil(accountId);
+  const chain = chainCooldowns.get(accountId);
+  if (chain) {
+    // Chain state is the source of truth once it was read after the local
+    // record had time to reach finality.
+    const localRecordedAt = localCooldown ? localCooldown - rateLimitWindowMs : 0;
+    if (!localCooldown || chain.checkedAt > localRecordedAt + CHAIN_FINALITY_GRACE_MS) {
+      return chain.until > now ? chain.until : 0;
+    }
+    return Math.max(localCooldown, chain.until > now ? chain.until : 0);
+  }
+  return localCooldown;
+}
+
+// Only call after the transaction succeeded on chain.
+function recordRequestCooldown(accountId) {
+  storeLocalCooldown(accountId, Date.now() + rateLimitWindowMs);
+  window.setTimeout(() => {
+    void refreshChainCooldown(accountId);
+  }, CHAIN_FINALITY_GRACE_MS + 5000);
+}
+
+function bytesToBase64(bytes) {
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return window.btoa(binary);
+}
+
+function base64ToBytes(base64) {
+  return Uint8Array.from(window.atob(base64), (char) => char.charCodeAt(0));
+}
+
+function readUnsignedLE(bytes, offset, length) {
+  if (offset + length > bytes.length) throw new Error("estado del contrato truncado");
+  let value = 0n;
+  for (let index = length - 1; index >= 0; index -= 1) {
+    value = (value << 8n) | BigInt(bytes[offset + index]);
+  }
+  return value;
+}
+
+function borshStringKey(prefixByte, text) {
+  const encoded = new TextEncoder().encode(text);
+  const key = new Uint8Array(5 + encoded.length);
+  key[0] = prefixByte;
+  new DataView(key.buffer).setUint32(1, encoded.length, true);
+  key.set(encoded, 5);
+  return key;
+}
+
+async function rpcQuery(params) {
+  const response = await fetch(RPC_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: "orbithire", method: "query", params }),
+    signal: AbortSignal.timeout(8000),
+  });
+  if (!response.ok) throw new Error(`RPC respondió HTTP ${response.status}`);
+  const body = await response.json();
+  if (body.error || !body.result || body.result.error) {
+    throw new Error(body.error?.message || body.result?.error || "respuesta RPC inválida");
+  }
+  return body.result;
+}
+
+async function viewContractState(prefixBytes) {
+  const result = await rpcQuery({
+    request_type: "view_state",
+    finality: "final",
+    account_id: CONTRACT_ID,
+    prefix_base64: bytesToBase64(prefixBytes),
+  });
+  if (!Array.isArray(result.values)) throw new Error("view_state sin valores");
+  return result.values;
+}
+
+async function loadRateLimitWindow() {
+  if (rateLimitWindowLoaded) return rateLimitWindowMs;
+  const stateKey = new TextEncoder().encode("STATE");
+  const values = await viewContractState(stateKey);
+  const entry = values.find((value) => value.key === bytesToBase64(stateKey));
+  if (!entry) throw new Error("el contrato no expone STATE");
+  const bytes = base64ToBytes(entry.value);
+  const view = new DataView(bytes.buffer);
+  let offset = 0;
+  for (let field = 0; field < 3; field += 1) {
+    offset += 4 + view.getUint32(offset, true);
+  }
+  const fee = readUnsignedLE(bytes, offset, 16);
+  if (fee !== BigInt(FEE_YOCTO)) throw new Error("formato de STATE inesperado");
+  offset += 16;
+  const windowMs = Number(readUnsignedLE(bytes, offset, 8) / 1000000n);
+  if (windowMs < 60 * 1000 || windowMs > 7 * 24 * 60 * 60 * 1000) {
+    throw new Error("ventana de límite fuera de rango");
+  }
+  rateLimitWindowMs = windowMs;
+  rateLimitWindowLoaded = true;
+  return rateLimitWindowMs;
+}
+
+async function fetchChainCooldownUntil(accountId) {
+  const windowMs = await loadRateLimitWindow();
+  const key = borshStringKey(RATE_LIMIT_STATE_KEY_PREFIX, accountId);
+  const values = await viewContractState(key);
+  const entry = values.find((value) => value.key === bytesToBase64(key));
+  if (!entry) return 0;
+  const bytes = base64ToBytes(entry.value);
+  if (bytes.length !== 8) throw new Error("formato de límite inesperado");
+  const lastRequestMs = Number(readUnsignedLE(bytes, 0, 8) / 1000000n);
+  if (lastRequestMs < Date.UTC(2024, 0, 1) || lastRequestMs > Date.now() + 10 * 60 * 1000) {
+    throw new Error("marca de tiempo del límite fuera de rango");
+  }
+  return lastRequestMs + windowMs;
+}
+
+async function refreshChainCooldown(accountId) {
+  if (!accountId) return;
+  const checkedAt = Date.now();
+  try {
+    const until = await fetchChainCooldownUntil(accountId);
+    chainCooldowns.set(accountId, { until, checkedAt });
+    const localCooldown = readLocalCooldownUntil(accountId);
+    if (until > Date.now()) {
+      if (until !== localCooldown) storeLocalCooldown(accountId, until);
+    } else if (
+      localCooldown &&
+      checkedAt > localCooldown - rateLimitWindowMs + CHAIN_FINALITY_GRACE_MS
+    ) {
+      clearLocalCooldown(accountId);
+    }
+  } catch (error) {
+    console.warn("No se pudo leer el límite de solicitudes desde la cadena:", error);
+  }
+  updateWalletUi();
+}
+
 function formatCooldown(remainingMs) {
-  const remainingSeconds = Math.ceil(remainingMs / 1000);
-  return remainingSeconds >= 60
-    ? `${Math.ceil(remainingSeconds / 60)} min`
-    : `${remainingSeconds} s`;
+  const remainingSeconds = Math.max(0, Math.ceil(remainingMs / 1000));
+  const minutes = Math.floor(remainingSeconds / 60);
+  const seconds = String(remainingSeconds % 60).padStart(2, "0");
+  return minutes > 0 ? `${minutes} min ${seconds} s` : `${remainingSeconds} s`;
+}
+
+function cooldownNoteText(cooldownUntil) {
+  const remaining = cooldownUntil - Date.now();
+  const availableAt = new Date(cooldownUntil).toLocaleTimeString("es-CL", {
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+  return `Esta cuenta ya tiene una solicitud registrada en la última hora (límite del contrato). Podrás pagar de nuevo en ${formatCooldown(remaining)} · a las ${availableAt}.`;
+}
+
+function syncCooldownTimer(accountId, cooldownUntil) {
+  if (cooldownUntil > Date.now()) {
+    cooldownAccountId = accountId;
+    if (!cooldownTimer) {
+      cooldownTimer = window.setInterval(() => {
+        const until = getRequestCooldownUntil(cooldownAccountId);
+        if (until > Date.now()) {
+          agentApiNote.textContent = cooldownNoteText(until);
+        } else {
+          window.clearInterval(cooldownTimer);
+          cooldownTimer = undefined;
+          updateWalletUi();
+        }
+      }, 1000);
+    }
+  } else if (cooldownTimer) {
+    window.clearInterval(cooldownTimer);
+    cooldownTimer = undefined;
+  }
 }
 
 function getRequestHistory(accountId) {
@@ -269,6 +458,10 @@ function updateWalletUi() {
     ? walletSelector.store.getState().accounts[0]?.accountId
     : "";
   renderHistory(accountId);
+  if (accountId && !chainCooldowns.has(accountId) && !chainCooldownRequests.has(accountId)) {
+    chainCooldownRequests.add(accountId);
+    void refreshChainCooldown(accountId).finally(() => chainCooldownRequests.delete(accountId));
+  }
   const cooldownUntil = getRequestCooldownUntil(accountId);
   const cooldownRemaining = Math.max(0, cooldownUntil - Date.now());
   walletButton.disabled = !walletReady;
@@ -285,9 +478,9 @@ function updateWalletUi() {
   } else {
     walletButton.textContent = "Conectar Meteor Wallet";
   }
+  syncCooldownTimer(accountId, cooldownUntil);
   if (cooldownRemaining > 0) {
-    agentApiNote.textContent =
-      `Esta cuenta ya envió una solicitud. El contrato permite una por hora; podrás pagar de nuevo en aproximadamente ${formatCooldown(cooldownRemaining)}.`;
+    agentApiNote.textContent = cooldownNoteText(cooldownUntil);
   } else if (agentApiStatusText) {
     agentApiNote.textContent = agentApiStatusText;
   }
@@ -552,11 +745,18 @@ async function submitQuery() {
     showMessage("Desconecta y vuelve a conectar Meteor Wallet antes de enviar una solicitud.");
     return;
   }
-  const cooldownRemaining = getRequestCooldownUntil(accountId) - Date.now();
-  if (cooldownRemaining > 0) {
+  isPreparingPayment = true;
+  updateWalletUi();
+  try {
+    await refreshChainCooldown(accountId);
+  } finally {
+    isPreparingPayment = false;
+  }
+  const cooldownUntil = getRequestCooldownUntil(accountId);
+  if (cooldownUntil > Date.now()) {
     showStatus("Límite de solicitudes activo", "warning");
     showMessage(
-      `El contrato permite una solicitud por cuenta cada hora. Espera aproximadamente ${formatCooldown(cooldownRemaining)} antes de volver a pagar.`,
+      `El contrato permite una solicitud por cuenta cada hora. ${cooldownNoteText(cooldownUntil)}`,
     );
     updateWalletUi();
     return;
@@ -611,8 +811,16 @@ async function submitQuery() {
         ),
       ],
     });
-    recordRequestCooldown(accountId);
     transactionHash = getTransactionHash(outcome);
+    const chainFailure = outcome?.status?.Failure;
+    if (chainFailure) {
+      const failureError = new Error(
+        `La transacción falló en la cadena: ${JSON.stringify(chainFailure)}`,
+      );
+      failureError.chainFailure = true;
+      throw failureError;
+    }
+    recordRequestCooldown(accountId);
     updateHistoryEntry(accountId, requestId, { transactionHash });
     if (transactionHash) {
       void fetch(`${AGENT_API_URL}/api/notify`, {
@@ -662,7 +870,20 @@ async function submitQuery() {
     );
     showMessage(result.message, requestId, transactionHash);
   } catch (error) {
-    if (transactionHash) {
+    const errorMessage = error.message || String(error);
+    const rateLimited = /rate limit exceeded/i.test(errorMessage);
+    if (rateLimited) void refreshChainCooldown(accountId);
+    if (error.chainFailure) {
+      updateHistoryEntry(accountId, requestId, { status: "failed", transactionHash });
+      showStatus("El contrato rechazó la solicitud", "warning");
+      showMessage(
+        rateLimited
+          ? "El contrato rechazó la llamada: esta cuenta ya tiene una solicitud en la última hora. El depósito se devuelve automáticamente; espera a que venza el límite."
+          : `El contrato rechazó la llamada; el depósito se devuelve automáticamente. ${errorMessage}`,
+        requestId,
+        transactionHash,
+      );
+    } else if (transactionHash) {
       updateHistoryEntry(accountId, requestId, {
         status: "pending",
         transactionHash,
@@ -676,8 +897,8 @@ async function submitQuery() {
     } else {
       updateHistoryEntry(accountId, requestId, { status: "failed" });
       showStatus("Pago cancelado o fallido", "warning");
-      const errorMessage = error.message || String(error);
-      const contractTrap = /WebAssembly trap|unreachable opcode/i.test(errorMessage);
+      const contractTrap =
+        rateLimited || /WebAssembly trap|unreachable opcode|Smart contract panicked/i.test(errorMessage);
       showMessage(
         contractTrap
           ? `El contrato rechazó la llamada. Cada intento usa un request_id nuevo, pero OrbitHire acepta una solicitud por cuenta cada hora. Si esta cuenta ya tuvo una solicitud exitosa en la última hora, espera a que venza ese límite. ${errorMessage}`
